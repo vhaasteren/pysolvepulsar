@@ -363,8 +363,9 @@ class PulsarSolver(object):
         Mj = self.get_jump_designmatrix(cand, fitpatch=fitpatch)
         #Mo = 1.0-self.get_jump_designmatrix_onepatch(cand, fitpatch=fitpatch)
         Mo = np.ones((nobs, 0 if fitpatch is None else 1))
-        Mt = self._psr.designmatrix(updatebats=True,
-                fixunits=True, fixsigns=True, incoffset=False)
+        #Mt = self._psr.designmatrix(updatebats=True,
+        #        fixunits=True, fixsigns=True, incoffset=False)
+        Mt = self.designmatrix(cand)
         Mtot = np.append(Mt, Mo, axis=1)
         Gj = self.get_jump_Gmatrix(cand, fitpatch=fitpatch)
         
@@ -377,7 +378,7 @@ class PulsarSolver(object):
         nparj = Mj.shape[1]
 
         # Create the noise and prior matrices
-        Nvec = (self._psr.toaerrs * 1e-6)**2
+        Nvec = self.toaerrs(cand)**2
         Phivect = np.array([self._prerr[key]**2 for key in self._prerr])
         Phiveco = np.array([jumpstd/self._psr['F0'].val]*Mo.shape[1])**2
         Phivec = np.append(Phivect, Phiveco)
@@ -388,8 +389,9 @@ class PulsarSolver(object):
         phipar = prpars * Phivec_inv
 
         # Set psr parameters, and remove the phase offsets of the patches
-        self._psr.vals(which='fit', values=cand.pars[:])
-        dt_lt = self._psr.residuals(removemean=False)
+        #self._psr.vals(which='fit', values=cand.pars[:])
+        #dt_lt = self._psr.residuals(removemean=False)
+        dt_lt = self.residuals(cand)
         dt, jvals = self.subtract_jumps(dt_lt, Mj, Nvec)
         pars = cand.pars # np.append(cand.pars, jvals)
 
@@ -445,78 +447,6 @@ class PulsarSolver(object):
         dd['parlabels'] = parlabels
         return dd
 
-
-    def get_prediction_decomposition_T(self, cand):
-        """Return the quantities necessary for prediction, given a candidate
-
-        For a given, properly maximized, candidate solution, calculate the
-        quantities that are necessary for prediction.
-
-        :param cand:
-            CandidateSolution candidate
-
-        NOTE: Deprecated (Using G-matrix formalism instead)
-        """
-        dd = dict()
-        self._logger.warn('Not using G-matrix formalism for prediction!')
-
-        # Create the full design matrix
-        Mj = self.get_jump_designmatrix(cand)
-        Mt = self._psr.designmatrix(updatebats=True,
-                fixunits=True, fixsigns=True, incoffset=False)
-        Mtot = np.append(Mt, Mj, axis=1)
-        npart = Mt.shape[1]
-        nparj = Mj.shape[1]
-
-        # Create the noise and prior matrices
-        Nvec = (self._psr.toaerrs * 1e-6)**2
-        Phivect = np.array([self._prerr[key]**2 for key in self._prerr])
-        Phivecj = np.ones(Mj.shape[1]) * np.inf
-        Phivec = np.append(Phivect, Phivecj)
-        Phivec_inv = np.append(1.0/Phivect, np.zeros_like(Phivecj))
-        prparst = np.array([self._prpars[key] for key in self._prpars])
-        prparsj = np.array([0.0]*nparj)
-        prpars = np.append(prparst-cand.pars, prparsj)
-
-        # Calculate Sigma (timing model + jumps)
-        # TODO: The SVD seem to be unstable here??
-        MNM = np.dot(Mtot.T / Nvec, Mtot)
-        Sigma_inv = MNM + np.diag(Phivec_inv)
-        #U, s, Vt = sl.svd(Sigma_inv)
-        #Sigma = np.dot(Vt.T / s, U.T)
-        cf = sl.cho_factor(Sigma_inv)
-        Sigma = sl.cho_solve(cf, np.eye(len(MNM)))
-
-        # Set psr parameters, and remove the phase offsets of the patches
-        self._psr.vals(which='fit', values=cand.pars[:])
-        dt_lt = self._psr.residuals(removemean=False)
-        dt, jvals = self.subtract_jumps(dt_lt, Mj, Nvec)
-        pars = np.append(cand.pars, jvals)
-
-        # Calculate the prediction stuff
-        # TODO: need to do this without the single-TOA patches?
-        MNt = np.dot(Mtot.T, dt / Nvec)
-        phipar = prpars * Phivec_inv
-
-        dpars = np.dot(Sigma, MNt + phipar)     # Should be approx~0.0
-        rp = np.dot(Mtot, np.dot(Sigma, MNt))   # Should be approx~0.0
-        rr = np.dot(Mtot, np.dot(Sigma, Mtot.T))
-        rr = np.dot(Mt, np.dot(np.diag(Phivect), Mt.T))
-
-        # Wrap up in a dictionary, and return
-        dd['Mj'] = Mj
-        dd['Mt'] = Mt
-        dd['Mtot'] = Mtot
-        dd['Nvec'] = Nvec
-        dd['Phivec'] = Phivec
-        dd['Phivec_inv'] = Phivec_inv
-        dd['Sigma_inv'] = Sigma_inv
-        dd['Sigma'] = Sigma
-        dd['dpars'] = dpars
-        dd['rp'] = rp
-        dd['stdrp'] = np.sqrt(np.diag(rr))
-        dd['pars'] = self._psr.pars(which='fit')
-        return dd
 
     def get_jump_designmatrix(self, cand, fitpatch=None):
         """Obtain the design matrix of inter-coherence-patch jumps
@@ -689,6 +619,156 @@ class PulsarSolver(object):
 
         return dt - dtj, jvals
 
+    def residuals(self, cand, exclude_nonconnected=False):
+        """Return the residuals, taking into account pulse number corrections
+
+        Given a candidate solution, return the timing residuals, taking into
+        account the relative pulse number corrections within coherent patches.
+        When exclude_nonconnected is True, only residuals within coherent
+        patches with more than one residual are being returned
+
+        Note: exclude_nonconnected will/might mess up the ordering of the
+              residuals
+
+        :param cand:
+            The candidate solution object
+
+        :param exclude_nonconnected:
+            If True, only return resiudals within coherent patches with more
+            than one residual
+        """
+        # Obtain the residuals as tempo2 would calculate them
+        self._psr.vals(which='fit', values=cand.pars)
+        dt_lt = self._psr.residuals(updatebats=True,
+                formresiduals=True, removemean=False)
+        pn_lt = self._psr.pulsenumbers(updatebats=False,
+                formresiduals=False, removemean=False)
+        P0 = 1.0 / self._psr['F0'].val
+
+        # Check against the recorded relative pulse numbers
+        dt = dt_lt.copy()
+        selection = np.array([], dtype=np.int) if exclude_nonconnected \
+                                               else np.arange(len(dt))
+        rpns = cand.get_rpns()
+        patches = cand.get_patches()
+        for pp, patch in enumerate(patches):
+            # Relative pulse numbers of patch, and from tempo2
+            rpn = np.array(rpns[pp])
+            rpn_lt = pn_lt[patch] - pn_lt[patch[0]]
+
+            dt[patch] += (rpn_lt - rpn) * P0
+
+            if exclude_nonconnected and len(patch) > 1:
+                selection = np.append(selection, patch)
+
+        return dt[selection]
+
+    def toas(self, cand, exclude_nonconnected=False):
+        """Return the toas, possibly excluding non-connected toas
+
+        Return the toas. If exclude_nonconnected is True, then only return the
+        toas for which the patches in cand contain more than one toa
+
+        Note: exclude_nonconnected will/might mess up the ordering of the
+              residuals
+
+        :param cand:
+            The candidate solution object
+
+        :param exclude_nonconnected:
+            If True, only return resiudals within coherent patches with more
+            than one residual
+        """
+        self._psr.vals(which='fit', values=cand.pars)
+        toas = self._psr.toas(updatebats=True)
+        selection = np.array([], dtype=np.int) if exclude_nonconnected \
+                                               else np.arange(len(toas))
+
+        if exclude_nonconnected:
+            patches = cand.get_patches()
+            for pp, patch in enumerate(patches):
+                # Only return if requested
+                if len(patch) > 1:
+                    selection = np.append(selection, patch)
+
+        return toas[selection]
+
+    def toaerrs(self, cand, exclude_nonconnected=False):
+        """Return the toa uncertainties, possibly excluding non-connected toas
+
+        Return the uncertainties. If exclude_nonconnected is True, then only
+        return the errors for which the patches in cand contain more than one
+        toa
+
+        Note: exclude_nonconnected will/might mess up the ordering of the
+              toas
+
+        :param cand:
+            The candidate solution object
+
+        :param exclude_nonconnected:
+            If True, only return uncertainties within coherent patches with more
+            than one residual
+        """
+        #self._psr.vals(which='fit', values=cand.pars)
+        toaerrs = self._psr.toaerrs*1e-6
+        selection = np.array([], dtype=np.int) if exclude_nonconnected \
+                                               else np.arange(len(toaerrs))
+
+        if exclude_nonconnected:
+            patches = cand.get_patches()
+            for pp, patch in enumerate(patches):
+                # Only return if requested
+                if len(patch) > 1:
+                    selection = np.append(selection, patch)
+
+        return toaerrs[selection]
+
+    def designmatrix(self, cand, exclude_nonconnected=False):
+        """Return the design matrix, possibly excluding non-connected epochs
+
+        Return the design matrix. If exclude_nonconnected is True, then only
+        return the rows for which the patches in cand contain more than one toa
+
+        Note: exclude_nonconnected will/might mess up the ordering of the
+              residuals
+
+        :param cand:
+            The candidate solution object
+
+        :param exclude_nonconnected:
+            If True, only return resiudals within coherent patches with more
+            than one residual
+        """
+        self._psr.vals(which='fit', values=cand.pars)
+        M = self._psr.designmatrix(updatebats=True, fixunits=True,
+                fixsigns=True, incoffset=False)
+
+        selection = np.array([], dtype=np.int) if exclude_nonconnected \
+                                               else np.arange(M.shape[0])
+
+        if exclude_nonconnected:
+            patches = cand.get_patches()
+            for pp, patch in enumerate(patches):
+                # Only return if requested
+                if len(patch) > 1:
+                    selection = np.append(selection, patch)
+
+        return M[selection,:]
+
+
+    def get_chi2_pvalue(self, cand):
+        """Return the chi2 p-value for this candidate solution
+
+        For the provided candidate solution, calculate the p-value of the chi^2
+        distribution, properly correcting for the number of degrees of freedom.
+        We are doing a one-sided test here.
+
+        :param cand:
+            The candidate solution object
+        """
+        pass
+
 
 class CandidateSolution(object):
     """
@@ -758,6 +838,28 @@ class CandidateSolution(object):
         else:
             patches = self._patches[:fitpatch] + self._patches[(fitpatch+1):]
         return patches
+
+    def get_number_of_toas(self, exclude_nonconnected=False):
+        """Get the number of toas, possibly excluding non-connected epochs
+
+        :param exclude_nonconnected:
+            If True, exclude coherent patches of length 1
+        """
+        ntoas = 0
+        for pp, patch in enumerate(self._patches):
+            ntoas += len(patch) if len(patch) > 1 else 0
+
+        return ntoas
+
+
+    def get_rpns(self, fitpatch=None):
+        """Get the relative pulse numbers, minus element `fitpatch` if not None
+        """
+        if fitpatch is None:
+            rpn = self._rpn
+        else:
+            rpn = self._rpn[:fitpatch] + self._rpn[(fitpatch+1):]
+        return rpn
 
     @property
     def pars(self):
