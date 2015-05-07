@@ -123,11 +123,13 @@ class PulsarSolver(object):
         #self._logger.addHandler(ch)
 
     def init_sorting_map(self):
-        """Provide the sorting map and its inversion
+        """Provide the sorting map and its inversion (NOT USED)
 
         In order to study the coherence length, we need the toas to be sorted.
         We therefore create an index map to and from the libstempo object. We
         use mergesort so that it keeps identical elements in order.
+
+        NOTE: These mappings are not used anymore
         """
         self._isort = np.argsort(self._psr.toas(), kind='mergesort')
         self._iisort = np.zeros_like(self._isort, dtype=np.int)
@@ -351,7 +353,7 @@ class PulsarSolver(object):
         Use the G-matrix formalism
         """
         dd = dict()
-        nobs = len(self._psr.toas())
+        nobs = self.nobs
 
         # Create the full design matrix
         # If we use 'fitpatch', we do not include a jump for patch 'fitpatch' in
@@ -713,6 +715,40 @@ class CandidateSolution(object):
         """
         self._patches = copy.deepcopy(patches)
         self._rpn = copy.deepcopy(rpn)
+
+    def join_patches(self, ind1, ind2, apn):
+        """Join patches ind1, and ind2
+
+        Given patch indices ind1 and ind2, join those two patches
+
+        :param ind1:
+            Index of patch one
+
+        :param ind2:
+            Index of patch two
+
+        :param apn:
+            Absolute pulse numbers (relative to PEPOCH) for all TOAs
+        """
+        ind1, ind2 = (ind1, ind2) if (ind1 < ind2) else (ind2, ind1)  # Sort
+        patches1, rpns1 = self._patches[:ind1], self._rpn[:ind1]
+        patches2, rpns2 = self._patches[ind1+1:ind2], self._rpn[ind1+1:ind2]
+        patches3, rpns3 = self._patches[ind2+1:], self._rpn[ind2+1:]
+        patch1, rpn1 = self._patches[ind1], self._rpn[ind1]
+        patch2, rpn2 = self._patches[ind2], self._rpn[ind2]
+
+        # Relative pulse number between patches
+        iprpn = apn[patch2[0]]-apn[patch1[0]]
+        patch2rpn = [rpn2[ii] + iprpn for ii in range(len(rpn2))]
+
+        # Make new patch
+        newpatch = patch1 + patch2
+        newrpn = rpn1 + patch2rpn
+
+        # Save all patches
+        self._patches = patches1 + [newpatch] + patches2 + patches3
+        self._rpn = rpns1 + [newrpn] + rpns2 + rpns3
+
 
     def get_patches(self, fitpatch=None):
         """Get the patches, minus element `fitpatch` if not None
