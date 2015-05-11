@@ -27,6 +27,15 @@ tempo2_excludepars = ['START', 'FINISH', 'PEPOCH', 'POSEPOCH', 'DMEPOCH', 'EPHVE
 # Parameters that are not always required to be fit for
 tempo2_nonmandatory = ['DM']
 
+# Parameter bounds (min, max):
+tempo2_parbounds = {'F0': (0.0, np.inf),
+                    'SINI': (0.0, 1.0),
+                    'ECC': (0.0, 1.0),
+                    'E': (0.0, 1.0)
+                    }
+
+tempo2_parbounds_front = {'JUMP': ('P0', -0.5, 0.5)}
+
 class PulsarSolver(object):
     """ This class provides a user interface to algorithmic timing methods
 
@@ -75,7 +84,9 @@ class PulsarSolver(object):
         self.init_priors(priors)
 
         # Start with one candidate solution (based on the prior)
-        self._candidates = [CandidateSolution(self._prpars, self.nobs)]
+        cand = CandidateSolution()
+        cand.set_start_solution(self._prpars, self.nobs)
+        self._candidates = [cand]
 
         # TODO: shift the PEPOCH
         self.set_pepoch_to_center()
@@ -136,6 +147,22 @@ class PulsarSolver(object):
         for ii, p in enumerate(self._isort):
             self._iisort[p] = ii
 
+    def get_prior_bounds(self, key):
+        """Given the parameter key, obtain the prior bound
+
+        Get the prior bound for the parameter key.
+        """
+        parmin, parmax = (-np.inf, np.inf) if not key in tempo2_parbounds \
+                                            else tempo2_parbounds[key]
+        if key[:4] in tempo2_parbounds_front:
+            # We have a JUMP or something like that
+            key_link = tempo2_parbounds_front[key[:4]][0]
+            par_mult = 1.0 if key_link is None else self._psr[key_link].val
+            parmin = par_mult * tempo2_parbounds_front[key[:4]][1]
+            parmax = par_mult * tempo2_parbounds_front[key[:4]][2]
+
+        return parmin, parmax
+
     def create_prior_from_psr(self):
         """Create the prior dictionary from the pulsar object
 
@@ -158,9 +185,13 @@ class PulsarSolver(object):
             if self._psr[key].err <= 0.0 and self._psr[key].fit:
                 self._logger.error('Prior for {0} cannot have 0 width'.
                         format(key))
-            
+
+            # TODO: tempo2_nonmandatory is not always excluded. Should not be
+            #       the case
             if not key in tempo2_excludepars and not key in tempo2_nonmandatory:
-                priors[key] = (self._psr[key].val, self._psr[key].err)
+                parmin, parmax = self.get_prior_bounds(key)
+                priors[key] = (self._psr[key].val, self._psr[key].err, \
+                        parmin, parmax)
 
         return priors
 
@@ -200,6 +231,8 @@ class PulsarSolver(object):
         self._pars = OrderedDict()
         self._prpars = OrderedDict()
         self._prerr = OrderedDict()
+        self._prmin = OrderedDict()
+        self._prmax = OrderedDict()
 
         # Start with the 'Offset' parameter: a general phase offset that is
         # always unknown and fit for
@@ -222,6 +255,8 @@ class PulsarSolver(object):
             self._pars[key] = self._psr[key].val
             self._prpars[key] = priors[key][0]
             self._prerr[key] = priors[key][1]
+            self._prmin[key] = priors[key][2]
+            self._prmax[key] = priors[key][3]
 
         # Check whether we have any unset parameters we have not addressed
         for key in np.unique(np.append(un_fit, un_set)):
@@ -241,6 +276,38 @@ class PulsarSolver(object):
         if pval < 0.5*siglevel or 1-pval < 0.5*siglevel:
             self._logger.warn("Parameter value of {0} in tail of the prior")
 
+    def make_pars_respect_constraints(self, cand, ass_cmin, ass_cmax):
+        """Make the parameters in `cand` respect the linear constraints
+
+        Make the parameters in `cand` respect the linear constraints, given by
+        the min/max boundaries. Return the new (temporary) candidate object, and
+        the mask of parameters that are being fixed.
+
+        :param cand:
+            The candidate solution from where to start
+
+        :param ass_cmin:
+            Assumed constraint minimum bounds to respect
+
+        :param ass_cmax:
+            Assumed constraint minimum bounds to respect
+        """
+        cmin = ass_cmin if ass_cmin is not None \
+                        else np.zeros(cand.npars, dtype=np.bool)
+        cmax = ass_cmax if ass_cmax is not None \
+                        else np.zeros(cand.npars, dtype=np.bool)
+        if np.any(np.logical_and(cmin, cmax)):
+            raise ValueError("Cannot satisfy both min and max constraints.")
+
+        prparsmin = np.array([self._prmin[key] for key in self._prmin])
+        prparsmax = np.array([self._prmax[key] for key in self._prmax])
+
+        newcand = CandidateSolution(cand)
+        newcand.pars[cmin] = prparsmin[cmin]
+        newcand.pars[cmax] = prparsmax[cmax]
+
+        return newcand, np.logical_not(np.logical_or(cmin, cmax))
+
     def set_pepoch_to_center(self):
         """Set the PEPOCH value to the middle of the dataset, if necessary
 
@@ -254,7 +321,7 @@ class PulsarSolver(object):
         #self._psr['PEPOCH'].fit = False
         self._logger.warn("PEPOCH translation not done yet!")
 
-    def get_mergable_patches(self, cand, jumpstd=100.0, mergetol=2.0):
+    def get_mergable_patches(self, cand, offstd=100.0, mergetol=2.0):
         """Given a candidate, see which coherence patches can be merged
 
         Given a candidate solution, use prediction to see which coherence
@@ -263,7 +330,7 @@ class PulsarSolver(object):
         :param cand:
             CandidateSolution candidate
 
-        :param jumpstd:
+        :param offstd:
             When using `fitpatch`, this parameter sets the width of the prior on
             the jump/offset of all patches
 
@@ -280,13 +347,13 @@ class PulsarSolver(object):
         # Get the mergables for all patches
         for ii, patch in enumerate(cand.get_patches()): 
             mergables.append(self.get_mergable_patches_onepatch(cand, ii,
-                    jumpstd=jumpstd, mergetol=mergetol))
+                    offstd=offstd, mergetol=mergetol))
 
         # For all non-zero mergables, see if there is not another one with
         # overlap. If so, only use the larges list.
-        dd = self.get_prediction_decomposition(cand)
+        dd = self.get_linear_solution(cand)
 
-    def get_mergable_patches_onepatch(self, cand, fitpatch, jumpstd=100.0,
+    def get_mergable_patches_onepatch(self, cand, fitpatch, offstd=100.0,
             mergetol=2.0):
         """Given a candidate and a patch, return potential mergable patches
 
@@ -304,7 +371,7 @@ class PulsarSolver(object):
         :param fitpatch:
             Patch number we are fitting to
 
-        :param jumpstd:
+        :param offstd:
             When using `fitpatch`, this parameter sets the width of the prior on
             the jump/offset of all patches
 
@@ -316,8 +383,7 @@ class PulsarSolver(object):
         :return:
             patch indices
         """
-        dd = self.get_prediction_decomposition(cand,
-                fitpatch=fitpatch, jumpstd=jumpstd)
+        dd = self.get_linear_solution(cand, fitpatch=fitpatch, offstd=offstd)
         P0 = 1.0 / self._psr['F0'].val
         obsns = np.where(dd['stdrp'] < mergetol*P0)[0]
         mergepatches = []
@@ -330,11 +396,12 @@ class PulsarSolver(object):
 
         return mergepatches
 
-    def get_prediction_decomposition(self, cand, fitpatch=None, jumpstd=100.0):
-        """Return the quantities necessary for prediction, given a candidate
+    def get_linear_solution(self, cand, fitpatch=None, offstd=100.0):
+        """Return the quantities necessary for solving the linear system
 
         For a given, properly maximized, candidate solution, calculate the
-        quantities that are necessary for prediction.
+        quantities that are necessary for maximum likelihood calculation and
+        prediction.
 
         "param cand:
             CandidateSolution candidate
@@ -342,11 +409,11 @@ class PulsarSolver(object):
         :param fitpatch:
             Number of the patch we are fitting to. This adds this particular
             patch/jump into the timing model (like a tempo2 offset), with a
-            Gaussian prior with standard deviation jumpstd*P0.
+            Gaussian prior with standard deviation offstd*P0.
             Ideally we would use a flat prior on [0, P0], but we cannot do that
             analytically.
 
-        :param jumpstd:
+        :param offstd:
             When using `fitpatch`, this parameter sets the width of the prior on
             the jump/offset of all patches
 
@@ -380,7 +447,7 @@ class PulsarSolver(object):
         # Create the noise and prior matrices
         Nvec = self.toaerrs(cand)**2
         Phivect = np.array([self._prerr[key]**2 for key in self._prerr])
-        Phiveco = np.array([jumpstd/self._psr['F0'].val]*Mo.shape[1])**2
+        Phiveco = np.array([offstd/self._psr['F0'].val]*Mo.shape[1])**2
         Phivec = np.append(Phivect, Phiveco)
         Phivec_inv = 1.0/Phivec
         prparst = np.array([self._prpars[key] for key in self._prpars])
@@ -405,9 +472,12 @@ class PulsarSolver(object):
             rr = np.dot(Mtot, np.dot(Sigma, Mtot.T))
             rr = np.dot(Mtot, np.dot(np.diag(Phivec), Mtot.T))
 
-            Np = None
-            MNM = None
-            MNt = None
+            Np = np.zeros((0,0))
+            MNM = np.zeros((0,0))
+            MNt = np.zeros(0)
+            Mp = np.zeros((0, Mtot.shape[1]))
+            dtp = np.zeros(0)
+            Np_cf = (np.zeros((0,0)), False)
         elif nparj < nobs:
             # Transform M, N, dt
             Mp = np.dot(Gj.T, Mtot)
@@ -431,10 +501,16 @@ class PulsarSolver(object):
             raise ValueError("# of patches is higher than # of observations")
 
         # Wrap up in a dictionary, and return
+        dd['dt'] = dt
+        dd['dtp'] = dtp
         dd['Mj'] = Mj
         dd['Mt'] = Mt
+        dd['Mtot'] = Mtot
+        dd['Mp'] = Mp
+        dd['Gj'] = Gj
         dd['Nvec'] = Nvec
         dd['Np'] = Np
+        dd['Np_cf'] = Np_cf
         dd['MNM'] = MNM
         dd['MNt'] = MNt
         dd['Phivec'] = Phivec
@@ -446,7 +522,6 @@ class PulsarSolver(object):
         dd['stdrp'] = np.sqrt(np.diag(rr))
         dd['parlabels'] = parlabels
         return dd
-
 
     def get_jump_designmatrix(self, cand, fitpatch=None):
         """Obtain the design matrix of inter-coherence-patch jumps
@@ -710,7 +785,6 @@ class PulsarSolver(object):
             If True, only return uncertainties within coherent patches with more
             than one residual
         """
-        #self._psr.vals(which='fit', values=cand.pars)
         toaerrs = self._psr.toaerrs*1e-6
         selection = np.array([], dtype=np.int) if exclude_nonconnected \
                                                else np.arange(len(toaerrs))
@@ -764,10 +838,215 @@ class PulsarSolver(object):
         distribution, properly correcting for the number of degrees of freedom.
         We are doing a one-sided test here.
 
+        The chi2 we are calculating is from the likelihood:
+        xi^2 =  (dt - M ksi)^T N^{-1} (dt - M ksi)
+
+        Where dt, N, and M are projected with the G-matrix
+
         :param cand:
             The candidate solution object
         """
-        pass
+        dd = self.get_linear_solution(cand)
+        dt = dd['dtp']
+        M = dd['Mp']
+        N_cf = dd['Np_cf']
+        ksi = cand.pars
+
+        # We calculate the p-value from chi2 and the degrees of freedom. If
+        # dof=0, the p-value equals 1 (no discrepancy).
+        dof = max(len(dt)-M.shape[1], 0)
+        pval = 1.0
+
+        if dof > 0:
+            xi2 = np.dot(dt, sl.cho_solve(N_cf, dt))
+            pval = sst.chi2.sf(xi2, dof)
+
+        return pval
+
+    def fit_constrained_iterative(self, cand, lltol=0.01, maxiter=10,
+            offstd=100.0):
+        """Perform a constrained, iterative, linear fit
+
+        From a given candidate solution starting point, iterate to the
+        maximum-likelihood solution using constrained linear least-squares fits.
+        The constraints are only allowed to be bounds on the parameter values
+        (no general linear constraints).
+
+        :param cand:
+            The candidate solution from where to start the fit
+            
+        :param lltol:
+            The log-likelihood tolerance for accepting a solution
+
+        :param maxiter:
+            The maximum number of iterations before complaining something is
+            wrong
+
+        :param offstd:
+            When using `fitpatch`, this parameter sets the width of the prior on
+            the jump/offset of all patches
+        """
+        # Assume no constraints are necessary, so set all to zero
+        ass_cmin = np.zeros(cand.npars, dtype=np.bool)
+        ass_cmax = np.zeros(cand.npars, dtype=np.bool)
+
+        dd = self.perform_linear_least_squares_fit(cand, offstd=100.0)
+
+    def perform_linear_least_squares_fit(self, cand, ass_cmin=None,
+            ass_cmax=None, fitpatch=None, offstd=100.0):
+        """Perform a constrained, linear, least-squares fit
+
+        Perform a constrained, linear, least-squares fit.
+
+        WARNING: the constraints are respected by removing degrees of freedom of
+                 the model. This is therefore not a true representation of the
+                 actual covariance in the model.
+
+        :param cand:
+            The candidate solution from where to start
+
+        :param ass_cmin:
+            Assumed constraint minimum bounds to respect
+
+        :param ass_cmax:
+            Assumed constraint minimum bounds to respect
+
+        :param fitpatch:
+            Number of the patch we are fitting to. This adds this particular
+            patch/jump into the timing model (like a tempo2 offset), with a
+            Gaussian prior with standard deviation offstd*P0.
+            Ideally we would use a flat prior on [0, P0], but we cannot do that
+            analytically.
+
+        :param offstd:
+            When using `fitpatch`, this parameter sets the width of the prior on
+            the jump/offset of all patches
+        """
+        dd = dict()
+        nobs = self.nobs
+
+        newcand, cmask = self.make_pars_respect_constraints(cand,
+                ass_cmin, ass_cmax)
+
+        # Create the full design matrix
+        # If we use 'fitpatch', we do not include a jump for patch 'fitpatch' in
+        # Mj. Instead, we include an offset for the entire dataset (Mo), because
+        # we need the uncertainty of the offset when doing prediction.
+        Mj = self.get_jump_designmatrix(newcand, fitpatch=fitpatch)
+        Mo = np.ones((nobs, 0 if fitpatch is None else 1))
+        Mt = self.designmatrix(newcand)[:,cmask]
+        Mtot = np.append(Mt, Mo, axis=1)
+        Gj = self.get_jump_Gmatrix(newcand, fitpatch=fitpatch)
+        
+        # The parameter identifiers/keys
+        parlabelst = list(np.array(self._psr.pars(which='fit'))[cmask])
+        parlabelso = ['PatchOffset'] * Mo.shape[1]
+        parlabels = parlabelst + parlabelso
+
+        npart = Mtot.shape[1]
+        nparj = Mj.shape[1]
+
+        # Create the noise and prior matrices
+        Nvec = self.toaerrs(newcand)**2
+        Phivect = np.array([self._prerr[key]**2 for key in self._prerr])[cmask]
+        Phiveco = np.array([offstd/self._psr['F0'].val]*Mo.shape[1])**2
+        Phivec = np.append(Phivect, Phiveco)
+        Phivec_inv = 1.0/Phivec
+        prparst = np.array([self._prpars[key] for key in self._prpars])[cmask]
+        prparso = np.array([0.0]*Mo.shape[1])
+        prpars = np.append(prparst, prparso)
+        prpars_delta = np.append(prparst-cand.pars, prparso-prparso)
+
+        # phipar is the ML value of the TM parameters. But: we are calculating
+        # it with respect to the current value of the TM parameters.
+        phipar = prpars_delta * Phivec_inv  # Instead of: phipar = prpars * Phivec_inv
+
+        # Set psr parameters, and remove the phase offsets of the patches
+        dt_lt = self.residuals(newcand)
+        dt, jvals = self.subtract_jumps(dt_lt, Mj, Nvec)
+
+        if nparj == nobs:
+            # We know nothing but the prior
+            Sigma_inv = np.diag(Phivec_inv)
+            Sigma = np.diag(Phivec)
+
+            dpars = np.dot(Sigma, phipar)
+            rp = 0.0 * dt               # Only true if pars chosen as ML prior
+            rr = np.dot(Mtot, np.dot(Sigma, Mtot.T))
+            rr = np.dot(Mtot, np.dot(np.diag(Phivec), Mtot.T))
+
+            Np = np.zeros((0,0))
+            MNM = np.zeros((0,0))
+            MNt = np.zeros(0)
+            Mp = np.zeros((0, Mtot.shape[1]))
+            dtp = np.zeros(0)
+            Np_cf = (np.zeros((0,0)), False)
+
+            loglik = 0.0
+            loglik_ml = 0.0
+        elif nparj < nobs:
+            # Transform M, N, dt
+            Mp = np.dot(Gj.T, Mtot)
+            dtp = np.dot(Gj.T, dt)
+            Np = np.dot(Gj.T * Nvec, Gj)
+            Np_cf = sl.cho_factor(Np)
+            MNM = np.dot(Mp.T, sl.cho_solve(Np_cf, Mp))
+            Sigma_inv = MNM + np.diag(Phivec_inv)
+
+            # TODO: Use regularized Mtot??
+            Sigma_inv_cf = sl.cho_factor(Sigma_inv)
+            Sigma = sl.cho_solve(Sigma_inv_cf, np.eye(len(MNM)))
+
+            # Calculate the prediction quantities
+            MNt = np.dot(Mp.T, sl.cho_solve(Np_cf, dtp))
+            dpars = np.dot(Sigma, MNt + phipar)
+            rp = np.dot(Mtot, np.dot(Sigma, MNt))   # Should be approx~0.0
+            rr = np.dot(Mtot, np.dot(Sigma, Mtot.T))
+
+            # Calculate the log-likelihood
+            logdetN2 = np.sum(np.log(np.diag(Np_cf[0])))
+            logdetphi2 = 0.5*np.sum(np.log(Phivec))
+            xi2dt = 0.5*np.dot(dtp, sl.cho_solve(Np_cf, dtp))
+            xi2phi = 0.5*np.sum(phipar**2/Phivec)
+            xi2phi1 = 0.5*np.dot(dpars, np.dot(Sigma_inv, dpars))
+            xi2_active = 0.5*np.dot(dpars, np.dot(Sigma_inv, dpars))
+            # NOTE: xi2_active is zero _if_ we move to ML solution. We are dpars
+            #       away from there. That's why we subtract it from loglik
+            loglik = -logdetN2-logdetphi2-xi2dt-xi2phi+xi2phi1-xi2_active
+            loglik_ml = -logdetN2-logdetphi2-xi2dt-xi2phi+xi2phi1
+
+            # We are not handeling the prior properly...
+            # phipar is in xi2phi, but not in xi2_active
+            #print("All: ", logdetN2, logdetphi2, xi2dt, xi2phi, xi2phi1, xi2_active)
+            #print("Phivec: ", Phivec)
+            #print("phipar: ", phipar)
+        else:
+            raise ValueError("# of patches is higher than # of observations")
+
+        # Wrap up in a dictionary, and return
+        dd['dt'] = dt                           # Timing residuals
+        dd['dtp'] = dtp                         # Projected timing residuals
+        dd['Mj'] = Mj                           # Jump design matrix
+        dd['Mt'] = Mt                           # Timing model design matrix
+        dd['Mtot'] = Mtot                       # Full design matrix
+        dd['Mp'] = Mp                           # Projected design matrix
+        dd['Gj'] = Gj                           # Jump design matrix G-matrix
+        dd['Nvec'] = Nvec                       # Noise matrix diagonal
+        dd['Np'] = Np                           # Projected noise matrix
+        dd['Np_cf'] = Np_cf                     # Cholesky factorized Np
+        dd['MNM'] = MNM                         # Data-only Sigma^-1
+        dd['MNt'] = MNt                         # Data-only parameters
+        dd['Phivec'] = Phivec                   # Prior diagnoal
+        dd['Phivec_inv'] = Phivec_inv           # Inverse prior diagonal
+        dd['Sigma_inv'] = Sigma_inv             # Parameter covariance (inv)
+        dd['Sigma'] = Sigma                     # Inverse parameter covariance
+        dd['dpars'] = dpars                     # Delta-parameters (the fit)
+        dd['rp'] = rp                           # Residual projection
+        dd['stdrp'] = np.sqrt(np.diag(rr))      # Residuals projection std
+        dd['parlabels'] = parlabels             # Parameter labels
+        dd['loglik'] = loglik                   # Log-likelihood
+        dd['loglik_ml'] = loglik_ml             # Log-likelihood (ML)
+        return dd
 
 
 class CandidateSolution(object):
@@ -776,7 +1055,41 @@ class CandidateSolution(object):
     solution will need to be refined further.
     """
 
-    def __init__(self, pars, nobs, patches=None, rpn=None):
+    def __init__(self, copyobject=None):
+        """Initialize a new candidate. Either empty, or make a copy
+
+        Initialize a new candidate. Either empty, or make a copy
+
+        :param copyobject:
+            If not none, the parameters from this object will be copied
+        """
+        self.init_empty()
+
+        if copyobject is not None:
+            self.copy_from_object(copyobject)
+
+    def init_empty(self):
+        """Initialize this object with empty attributes
+        """
+        self._pars = []
+        self._patches = []
+        self._rpn = []
+
+        # TODO: implement this properly
+        self._parent = None
+        self._children = []
+
+    def copy_from_object(self, copyobject):
+        """Copy all the information from an object into this one.
+
+        Copy all the information from an object into this one. This object will
+        be an orphan: the parent/child information is not copied.
+        """
+        self._pars = copy.deepcopy(copyobject._pars)
+        self._rpn = copy.deepcopy(copyobject._rpn)
+        self._patches = copy.deepcopy(copyobject._patches)
+
+    def set_start_solution(self, pars, nobs, patches=None, rpn=None):
         self._pars = pars
 
         if patches is None or rpn is None:
@@ -864,6 +1177,10 @@ class CandidateSolution(object):
     @property
     def pars(self):
         return self._pars
+
+    @property
+    def npars(self):
+        return len(self.pars)
 
     @pars.setter
     def pars(self, value):
