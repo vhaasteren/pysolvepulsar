@@ -46,7 +46,7 @@ class PulsarSolver(object):
     """
 
     def __init__(self, parfile, timfile, priors=None, logfile=None,
-            loglevel=logging.DEBUG):
+            loglevel=logging.DEBUG, delete_prob=0.01):
         """Initialize the pulsar solver
 
         Initialize the pulsar solver by loading a libstempo object from a
@@ -66,9 +66,13 @@ class PulsarSolver(object):
 
         :param loglevel:
             Level of logging
+
+        :param delete_prob:
+            Proability that an observation needs to be deleted. Can be an array,
+            with per-obs probabilities as well (default: 0.01)
         """
         self.load_pulsar(parfile, timfile)
-        self.init_sorting_map()
+        self.init_sorting_map()     # TODO: start using the sorting map again
 
         # Set the logger
         if logfile is None:
@@ -82,6 +86,9 @@ class PulsarSolver(object):
         else:
             self._logger.info("Prior given separately. Ignore those in the psr object.")
         self.init_priors(priors)
+
+        # Set the deleted-point probabilities
+        self.delete_prob = np.ones(self.nobs) * delete_prob
 
         # Start with one candidate solution (based on the prior)
         cand = CandidateSolution()
@@ -139,8 +146,6 @@ class PulsarSolver(object):
         In order to study the coherence length, we need the toas to be sorted.
         We therefore create an index map to and from the libstempo object. We
         use mergesort so that it keeps identical elements in order.
-
-        NOTE: These mappings are not used anymore
         """
         self._isort = np.argsort(self._psr.toas(), kind='mergesort')
         self._iisort = np.zeros_like(self._isort, dtype=np.int)
@@ -233,13 +238,6 @@ class PulsarSolver(object):
         self._prerr = OrderedDict()
         self._prmin = OrderedDict()
         self._prmax = OrderedDict()
-
-        # Start with the 'Offset' parameter: a general phase offset that is
-        # always unknown and fit for
-        #self._pars['Offset'] = 0.0
-        #self._prpars['Offset'] = 0.0
-        #self._prerr['Offset'] = 2.0 / self._psr['F0'].val   # 2 * P0
-        # NOTE: We should not have placed a prior on the phase offset anyway!
 
         for key in priors:
             self._psr[key].set = True
@@ -396,133 +394,6 @@ class PulsarSolver(object):
 
         return mergepatches
 
-    def get_linear_solution(self, cand, fitpatch=None, offstd=100.0):
-        """Return the quantities necessary for solving the linear system
-
-        For a given, properly maximized, candidate solution, calculate the
-        quantities that are necessary for maximum likelihood calculation and
-        prediction.
-
-        "param cand:
-            CandidateSolution candidate
-
-        :param fitpatch:
-            Number of the patch we are fitting to. This adds this particular
-            patch/jump into the timing model (like a tempo2 offset), with a
-            Gaussian prior with standard deviation offstd*P0.
-            Ideally we would use a flat prior on [0, P0], but we cannot do that
-            analytically.
-
-        :param offstd:
-            When using `fitpatch`, this parameter sets the width of the prior on
-            the jump/offset of all patches
-
-        Use the G-matrix formalism
-        """
-        dd = dict()
-        nobs = self.nobs
-
-        # Create the full design matrix
-        # If we use 'fitpatch', we do not include a jump for patch 'fitpatch' in
-        # Mj. Instead, we include an offset for the entire dataset (Mo), because
-        # we need the uncertainty of the offset when doing prediction.
-        # TODO: change this when using without fitpatch??
-        Mj = self.get_jump_designmatrix(cand, fitpatch=fitpatch)
-        #Mo = 1.0-self.get_jump_designmatrix_onepatch(cand, fitpatch=fitpatch)
-        Mo = np.ones((nobs, 0 if fitpatch is None else 1))
-        #Mt = self._psr.designmatrix(updatebats=True,
-        #        fixunits=True, fixsigns=True, incoffset=False)
-        Mt = self.designmatrix(cand)
-        Mtot = np.append(Mt, Mo, axis=1)
-        Gj = self.get_jump_Gmatrix(cand, fitpatch=fitpatch)
-        
-        # The parameter identifiers/keys
-        parlabelst = list(self._psr.pars(which='fit'))
-        parlabelso = ['PatchOffset'] * Mo.shape[1]
-        parlabels = parlabelst + parlabelso
-
-        npart = Mtot.shape[1]
-        nparj = Mj.shape[1]
-
-        # Create the noise and prior matrices
-        Nvec = self.toaerrs(cand)**2
-        Phivect = np.array([self._prerr[key]**2 for key in self._prerr])
-        Phiveco = np.array([offstd/self._psr['F0'].val]*Mo.shape[1])**2
-        Phivec = np.append(Phivect, Phiveco)
-        Phivec_inv = 1.0/Phivec
-        prparst = np.array([self._prpars[key] for key in self._prpars])
-        prparso = np.array([0.0]*Mo.shape[1])
-        prpars = np.append(prparst, prparso)
-        phipar = prpars * Phivec_inv
-
-        # Set psr parameters, and remove the phase offsets of the patches
-        #self._psr.vals(which='fit', values=cand.pars[:])
-        #dt_lt = self._psr.residuals(removemean=False)
-        dt_lt = self.residuals(cand)
-        dt, jvals = self.subtract_jumps(dt_lt, Mj, Nvec)
-        pars = cand.pars # np.append(cand.pars, jvals)
-
-        if nparj == nobs:
-            # We know nothing but the prior
-            Sigma_inv = np.diag(Phivec_inv)
-            Sigma = np.diag(Phivec)
-
-            dpars = np.dot(Sigma, phipar)
-            rp = 0.0 * dt               # Only true if pars chosen as ML prior
-            rr = np.dot(Mtot, np.dot(Sigma, Mtot.T))
-            rr = np.dot(Mtot, np.dot(np.diag(Phivec), Mtot.T))
-
-            Np = np.zeros((0,0))
-            MNM = np.zeros((0,0))
-            MNt = np.zeros(0)
-            Mp = np.zeros((0, Mtot.shape[1]))
-            dtp = np.zeros(0)
-            Np_cf = (np.zeros((0,0)), False)
-        elif nparj < nobs:
-            # Transform M, N, dt
-            Mp = np.dot(Gj.T, Mtot)
-            dtp = np.dot(Gj.T, dt)
-            Np = np.dot(Gj.T * Nvec, Gj)
-            Np_cf = sl.cho_factor(Np)
-            MNM = np.dot(Mp.T, sl.cho_solve(Np_cf, Mp))
-            Sigma_inv = MNM + np.diag(Phivec_inv)
-
-            # TODO: Use regularized Mtot??
-            Sigma_inv_cf = sl.cho_factor(Sigma_inv)
-            Sigma = sl.cho_solve(Sigma_inv_cf, np.eye(len(MNM)))
-
-            # Calculate the prediction quantities
-            MNt = np.dot(Mp.T, sl.cho_solve(Np_cf, dtp))
-            dpars = np.dot(Sigma, MNt + phipar)
-            rp = np.dot(Mtot, np.dot(Sigma, MNt))   # Should be approx~0.0
-            rr = np.dot(Mtot, np.dot(Sigma, Mtot.T))
-
-        else:
-            raise ValueError("# of patches is higher than # of observations")
-
-        # Wrap up in a dictionary, and return
-        dd['dt'] = dt
-        dd['dtp'] = dtp
-        dd['Mj'] = Mj
-        dd['Mt'] = Mt
-        dd['Mtot'] = Mtot
-        dd['Mp'] = Mp
-        dd['Gj'] = Gj
-        dd['Nvec'] = Nvec
-        dd['Np'] = Np
-        dd['Np_cf'] = Np_cf
-        dd['MNM'] = MNM
-        dd['MNt'] = MNt
-        dd['Phivec'] = Phivec
-        dd['Phivec_inv'] = Phivec_inv
-        dd['Sigma_inv'] = Sigma_inv
-        dd['Sigma'] = Sigma
-        dd['dpars'] = dpars
-        dd['rp'] = rp
-        dd['stdrp'] = np.sqrt(np.diag(rr))
-        dd['parlabels'] = parlabels
-        return dd
-
     def get_jump_designmatrix(self, cand, fitpatch=None):
         """Obtain the design matrix of inter-coherence-patch jumps
 
@@ -536,11 +407,10 @@ class PulsarSolver(object):
             If not None, exclude this patch from the designmatrix jumps
 
         """
-        nobs = len(self._psr.toas())
         patches = cand.get_patches(fitpatch=fitpatch)
 
         npatches = len(patches)
-        Mj = np.zeros((nobs, npatches))
+        Mj = np.zeros((self.nobs, npatches))
         for pp, patch in enumerate(patches):
             Mj[patch,pp] = True
 
@@ -555,13 +425,12 @@ class PulsarSolver(object):
         :param fitpatch:
             Get the designmatrix of the jump for this patch number
         """
-        nobs = len(self._psr.toas())
         if fitpatch is not None:
             patch = cand._patches[fitpatch]
-            Mj = np.zeros((nobs, 1))
+            Mj = np.zeros((self.nobs, 1))
             Mj[patch,0] = True
         else:
-            Mj = np.zeros((nobs, 0))
+            Mj = np.zeros((self.nobs, 0))
         return Mj
 
     def get_jump_Gmatrix(self, cand, fitpatch=None):
@@ -577,15 +446,13 @@ class PulsarSolver(object):
             If not None, exclude this patch from the designmatrix jumps
 
         """
-        nobs = len(self._psr.toas())
-    
         # If fitpatch is not None, we have one extra column. We therefore need
         # all patches (fitpatch = None in get_patches)
         patches = cand.get_patches(fitpatch=None)
         add_fitpatch_cols = 0 if fitpatch is None else 1
 
         npatches = len(patches)
-        Gj = np.zeros((nobs, nobs-npatches+add_fitpatch_cols))
+        Gj = np.zeros((self.nobs, self.nobs-npatches+add_fitpatch_cols))
         ind = 0
         for pp, patch in enumerate(patches):
             ngsize = len(patch)
@@ -715,9 +582,9 @@ class PulsarSolver(object):
         # Obtain the residuals as tempo2 would calculate them
         self._psr.vals(which='fit', values=cand.pars)
         dt_lt = self._psr.residuals(updatebats=True,
-                formresiduals=True, removemean=False)
+                formresiduals=True, removemean=False)[self._isort]
         pn_lt = self._psr.pulsenumbers(updatebats=False,
-                formresiduals=False, removemean=False)
+                formresiduals=False, removemean=False)[self._isort]
         P0 = 1.0 / self._psr['F0'].val
 
         # Check against the recorded relative pulse numbers
@@ -755,7 +622,7 @@ class PulsarSolver(object):
             than one residual
         """
         self._psr.vals(which='fit', values=cand.pars)
-        toas = self._psr.toas(updatebats=True)
+        toas = self._psr.toas(updatebats=True)[self._isort]
         selection = np.array([], dtype=np.int) if exclude_nonconnected \
                                                else np.arange(len(toas))
 
@@ -785,7 +652,7 @@ class PulsarSolver(object):
             If True, only return uncertainties within coherent patches with more
             than one residual
         """
-        toaerrs = self._psr.toaerrs*1e-6
+        toaerrs = self._psr.toaerrs[self._isort]*1e-6
         selection = np.array([], dtype=np.int) if exclude_nonconnected \
                                                else np.arange(len(toaerrs))
 
@@ -816,7 +683,7 @@ class PulsarSolver(object):
         """
         self._psr.vals(which='fit', values=cand.pars)
         M = self._psr.designmatrix(updatebats=True, fixunits=True,
-                fixsigns=True, incoffset=False)
+                fixsigns=True, incoffset=False)[self._isort,:]
 
         selection = np.array([], dtype=np.int) if exclude_nonconnected \
                                                else np.arange(M.shape[0])
@@ -863,7 +730,7 @@ class PulsarSolver(object):
 
         return pval
 
-    def fit_constrained_iterative(self, cand, lltol=0.01, maxiter=10,
+    def fit_constrained_iterative(self, cand, lltol=0.1, maxiter=10,
             offstd=100.0):
         """Perform a constrained, iterative, linear fit
 
@@ -887,10 +754,37 @@ class PulsarSolver(object):
             the jump/offset of all patches
         """
         # Assume no constraints are necessary, so set all to zero
-        ass_cmin = np.zeros(cand.npars, dtype=np.bool)
-        ass_cmax = np.zeros(cand.npars, dtype=np.bool)
+        newcand = CandidateSolution(cand)
+        ass_cmin = np.zeros(newcand.npars, dtype=np.bool)
+        ass_cmax = np.zeros(newcand.npars, dtype=np.bool)
 
-        dd = self.perform_linear_least_squares_fit(cand, offstd=100.0)
+        notdone = True
+        loglik, prevloglik = np.inf, np.inf
+        niter = 0
+
+        while notdone and niter < maxiter:
+            dd = self.perform_linear_least_squares_fit(newcand, offstd=100.0)
+            loglik = dd['loglik_ml']
+            newpars = dd['newpars']
+            newpars[dd['cmask']] += dd['dpars']
+            prparsmin = np.array([self._prmin[key] for key in self._prmin])
+            prparsmax = np.array([self._prmax[key] for key in self._prmax])
+            newcand.pars = newpars
+            niter += 1
+
+            ass_cmin = (newpars < prparsmin)
+            ass_cmax = (newpars > prparsmax)
+
+            if np.sum(np.append(ass_cmin, ass_cmax)) == 0 and \
+                    np.abs(loglik - prevloglik) <= lltol:
+                notdone = False
+            else:
+                prevloglik = loglik
+
+        if niter == maxiter:
+            self._logger.warn("Maximum number of iterations reached")
+
+        return newcand, loglik
 
     def perform_linear_least_squares_fit(self, cand, ass_cmin=None,
             ass_cmax=None, fitpatch=None, offstd=100.0):
@@ -1007,19 +901,15 @@ class PulsarSolver(object):
             logdetN2 = np.sum(np.log(np.diag(Np_cf[0])))
             logdetphi2 = 0.5*np.sum(np.log(Phivec))
             xi2dt = 0.5*np.dot(dtp, sl.cho_solve(Np_cf, dtp))
-            xi2phi = 0.5*np.sum(phipar**2/Phivec)
+            xi2phi = 0.5*np.sum(prpars_delta**2/Phivec)
             xi2phi1 = 0.5*np.dot(dpars, np.dot(Sigma_inv, dpars))
             xi2_active = 0.5*np.dot(dpars, np.dot(Sigma_inv, dpars))
             # NOTE: xi2_active is zero _if_ we move to ML solution. We are dpars
-            #       away from there. That's why we subtract it from loglik
+            #       away from there. That's why we subtract it from loglik.
+            #       Note also that, now, xi2phi1 and zi2_active are the same in
+            #       this rescaling
             loglik = -logdetN2-logdetphi2-xi2dt-xi2phi+xi2phi1-xi2_active
             loglik_ml = -logdetN2-logdetphi2-xi2dt-xi2phi+xi2phi1
-
-            # We are not handeling the prior properly...
-            # phipar is in xi2phi, but not in xi2_active
-            #print("All: ", logdetN2, logdetphi2, xi2dt, xi2phi, xi2phi1, xi2_active)
-            #print("Phivec: ", Phivec)
-            #print("phipar: ", phipar)
         else:
             raise ValueError("# of patches is higher than # of observations")
 
@@ -1046,6 +936,35 @@ class PulsarSolver(object):
         dd['parlabels'] = parlabels             # Parameter labels
         dd['loglik'] = loglik                   # Log-likelihood
         dd['loglik_ml'] = loglik_ml             # Log-likelihood (ML)
+        dd['cmask'] = cmask                     # The non-constraints mask
+        dd['newpars'] = newcand.pars
+        return dd
+
+    def get_linear_solution(self, cand, fitpatch=None, offstd=100.0):
+        """Return the quantities necessary for solving the linear system
+
+        For a given, properly maximized, candidate solution, calculate the
+        quantities that are necessary for maximum likelihood calculation and
+        prediction.
+
+        "param cand:
+            CandidateSolution candidate
+
+        :param fitpatch:
+            Number of the patch we are fitting to. This adds this particular
+            patch/jump into the timing model (like a tempo2 offset), with a
+            Gaussian prior with standard deviation offstd*P0.
+            Ideally we would use a flat prior on [0, P0], but we cannot do that
+            analytically.
+
+        :param offstd:
+            When using `fitpatch`, this parameter sets the width of the prior on
+            the jump/offset of all patches
+
+        Use the G-matrix formalism
+        """
+        dd = self.perform_linear_least_squares_fit(cand, fitpatch=fitpatch,
+                offstd=offstd)
         return dd
 
 
@@ -1075,19 +994,154 @@ class CandidateSolution(object):
         self._patches = []
         self._rpn = []
 
-        # TODO: implement this properly
-        self._parent = None
-        self._children = []
+        # Tree references
+        self._parent = None                 # Parent solution
+        self._delete_children = []          # Children through deletion
+        self._merge_children = []           # Children through patch-mergers
+
+        # P-values
+        self._delete_pvals_hist = []        # History of deletion p-values
+        self._parent_chi2pval = None        # Chi2 p-value of parent
+        self._proposed_pval = None          # Prior-proposal probability
+        self._origin = "root"               # Proposal origin
+        self._chi2 = None                   # Chi2 value of current solution
+        self._dof = None                    # Chi2 degrees of freedom
+        self._child_merge_pvals = None      # All children merge prior pvals
+
+    def get_child_index_from_phase_shift(self, rpnshift, pi1, pi2):
+        """Get the child-index for a particular proposed phase shift
+
+        Given a shift in relative phase `rpnshift` between patch pi1 and patch
+        pi2, return the index of the child candidate
+
+        :param rpnshift:
+            The integer shift in relative phase between patch pi1 and pi2
+
+        :param pi1:
+            Index of coherence patch 1
+
+        :param pi2:
+            Index of coherence patch 2. Must be pi+1 or pi-1, since we are only
+            merging adjacent coherence patches...
+        """
+        if not pi2 in [pi+1, pi-1]:
+            raise ValueError("Can only merge adjacent coherent patches")
+        
+        # Sort the indices and determine the order of the tree
+        pi1, pi2 = (pi1, pi2) if pi1 < pi2 else (pi2, pi1)
+        tree_index = pi1
+        order = np.abs(rpnshift)
+        nelements = 2*order+1
+
+        # Properly grow the tree
+        self.grow_merge_child_list(tree_index, order)
+
+        mclen = len(self._merge_children[tree_index])
+        neworder = (mclen-1)/2
+        return order + rpnshift
+
+    def grow_merge_child_list(self, tree_index, order):
+        """Given the tree index of the child mergers, grow the child list
+
+        Grow the child list for a specific tree index properly (per two or same
+        order).
+
+        :param tree_index:
+            Index of the tree (which patches to merge)
+
+        :param order:
+            Grow the tree until this order
+        """
+        if order<0:
+            raise ValueError("Order of the tree must be >= 0")
+        mclen = len(self._merge_children[tree_index])
+        nelements = 2*order+1
+        if mclen == 0:
+            self._merge_children = [None] * nelements
+        elif (mclen-1) % 2 == 0:
+            # Grow properly
+            while mclen < nelements:
+                self._merge_children.append(None)
+                self._merge_children.insert(0, None)
+                mclen += 2
+        else:
+            raise ValueError("_merge_children not grown properly")
+
+    def get_ssp_len(self):
+        """Return the number of single-point patches
+
+        Return the number of single-point patches
+        """
+        nop = np.array([len(patch) for patch in self._patches])
+        return np.sum(nop == 1)
+
+    def get_patch_from_sspind(self, sspind):
+        """Return the patch index from the single-point patch index
+
+        Return the patch index from the single-point patch index
+
+        :param sspind:
+            Single point patch index
+        """
+        nop = np.array([len(patch) for patch in self._patches])
+        inds = np.where(nop == 1)[0]
+        return inds[sspind]
 
     def copy_from_object(self, copyobject):
         """Copy all the information from an object into this one.
 
         Copy all the information from an object into this one. This object will
         be an orphan: the parent/child information is not copied.
+
+        :param copyobject:
+            The CandidateSolution object to copy stuff from
         """
         self._pars = copy.deepcopy(copyobject._pars)
         self._rpn = copy.deepcopy(copyobject._rpn)
         self._patches = copy.deepcopy(copyobject._patches)
+
+    def integrate_in_tree(self, origin, parent, parent_chi2pval, proposed_pval):
+        """Integrate this solution in the candidate solution tree
+
+        Integrate this solution in the candidate solution tree, and have the
+        parent do the same.
+
+        NOTE: the patches should already be joined here
+
+        :param origin:
+            What the origin of this candidate solution is. Available options are
+            'root', ('delete', patch_ind), (rpn_shift, (patch_ind1, patch_ind2))
+
+        :param parent:
+            Reference to the parent object
+
+        :param parent_chi2pval:
+            The p-value of the parent chi2 solution
+
+        :param proposed_pval:
+            The p-value of this candidate, prior to evaluation/optimization
+        """
+        if origin == 'root':
+            self._origin = 'root'
+            self._parent = None
+            self._parent_chi2pval = None
+        else:
+            self._origin = origin
+            self._parent = parent
+            self._parent_chi2pval = parent_chi2pval
+            self._proposed_pval = proposed_pval
+
+            if origin[0] == 'delete':
+                # Deleted point
+                self._parent._delete_children[origin[1]] = self
+                self._delete_pvals_hist.append(proposed_pval)
+            else:
+                # It's a relative pulse-number shift
+                merge_ind = k blah
+                self._parent._merge_children blah
+
+        self._delete_children = [None] * self.get_ssp_len()
+        self._merge_children = [[]] * (len(self._patches)-1)
 
     def set_start_solution(self, pars, nobs, patches=None, rpn=None):
         self._pars = pars
@@ -1109,10 +1163,12 @@ class CandidateSolution(object):
         self._patches = copy.deepcopy(patches)
         self._rpn = copy.deepcopy(rpn)
 
-    def join_patches(self, ind1, ind2, apn):
+    def join_patches(self, ind1, ind2, apn, rpnjump=0):
         """Join patches ind1, and ind2
 
-        Given patch indices ind1 and ind2, join those two patches
+        Given patch indices ind1 and ind2, join those two patches. Even though
+        we usually only merge adjacent patches, ind1 and ind2 are allowed to be
+        arbitrary.
 
         :param ind1:
             Index of patch one
@@ -1121,7 +1177,10 @@ class CandidateSolution(object):
             Index of patch two
 
         :param apn:
-            Absolute pulse numbers (relative to PEPOCH) for all TOAs
+            Absolute pulse numbers (relative to PEPOCH) for all TOAs (np array)
+
+        :param rpnjump:
+            Jump in relative pulse number that we'll add to patch 2 (default=0)
         """
         ind1, ind2 = (ind1, ind2) if (ind1 < ind2) else (ind2, ind1)  # Sort
         patches1, rpns1 = self._patches[:ind1], self._rpn[:ind1]
@@ -1131,7 +1190,7 @@ class CandidateSolution(object):
         patch2, rpn2 = self._patches[ind2], self._rpn[ind2]
 
         # Relative pulse number between patches
-        iprpn = apn[patch2[0]]-apn[patch1[0]]
+        iprpn = apn[patch2[0]]-apn[patch1[0]] + rpnjump
         patch2rpn = [rpn2[ii] + iprpn for ii in range(len(rpn2))]
 
         # Make new patch
@@ -1164,7 +1223,6 @@ class CandidateSolution(object):
 
         return ntoas
 
-
     def get_rpns(self, fitpatch=None):
         """Get the relative pulse numbers, minus element `fitpatch` if not None
         """
@@ -1174,14 +1232,40 @@ class CandidateSolution(object):
             rpn = self._rpn[:fitpatch] + self._rpn[(fitpatch+1):]
         return rpn
 
+    def regisger_optimized_results(self, pars, chi2, dof, child_merge_pvals):
+        """After running an optimizer on this candidate, register the results
+
+        After running an optimizer on this candidate, register all the
+        probability results, so we can initialize children
+
+        :param pars:
+            Parameters found by the optimizer
+
+        :param chi2:
+            Chi^2 value of the solution
+
+        :param dof:
+            Number of effective degrees of freedom of the solution
+
+        :param child_merge_pvals:
+            A tree of all possible children p-values, as predicted by the
+            Gaussian process approximation. The tree is 'only' populated up to
+            some lowest p-value
+        """
+        self.pars = pars
+        self._chi2 = chi2
+        self._dof = dof
+        self._child_merge_pvals = child_merge_pvals
+        
+
     @property
     def pars(self):
         return self._pars
 
-    @property
-    def npars(self):
-        return len(self.pars)
-
     @pars.setter
     def pars(self, value):
         self._pars = value
+
+    @property
+    def npars(self):
+        return len(self.pars)
