@@ -15,6 +15,7 @@ import logging
 import libstempo as lt
 import os, glob, sys
 import copy
+import bisect
 
 try:
     from collections import OrderedDict
@@ -72,7 +73,7 @@ class PulsarSolver(object):
             with per-obs probabilities as well (default: 0.01)
         """
         self.load_pulsar(parfile, timfile)
-        self.init_sorting_map()     # TODO: start using the sorting map again
+        self.init_sorting_map()
 
         # Set the logger
         if logfile is None:
@@ -92,7 +93,7 @@ class PulsarSolver(object):
 
         # Start with one candidate solution (based on the prior)
         cand = CandidateSolution()
-        cand.set_start_solution(self._prpars, self.nobs)
+        cand.set_start_solution(self)
         self._candidates = [cand]
 
         # TODO: shift the PEPOCH
@@ -319,80 +320,55 @@ class PulsarSolver(object):
         #self._psr['PEPOCH'].fit = False
         self._logger.warn("PEPOCH translation not done yet!")
 
-    def get_mergable_patches(self, cand, offstd=100.0, mergetol=2.0):
-        """Given a candidate, see which coherence patches can be merged
+    def get_merge_pvals(self, cand, minpval=0.01, offstd=100.0):
+        """For candidate solution cand, get the merge p-value tree.
 
-        Given a candidate solution, use prediction to see which coherence
-        patches are within a coherence length, so that they can be merged.
+        For candidate solution cand, get the merge p-value tree down to
+        proposals with a p-value of minpval. We are only proposing to merge
+        adjacent patches/observations.
 
-        :param cand:
-            CandidateSolution candidate
-
-        :param offstd:
-            When using `fitpatch`, this parameter sets the width of the prior on
-            the jump/offset of all patches
-
-        :param mergetol"
-            How much larger the prediction uncertainty can be than the pulse
-            period for us to still include a merge (potentially with a phase
-            jump)
-
-        :return:
-            list of patch lists
-        """
-        mergables = []
-
-        # Get the mergables for all patches
-        for ii, patch in enumerate(cand.get_patches()): 
-            mergables.append(self.get_mergable_patches_onepatch(cand, ii,
-                    offstd=offstd, mergetol=mergetol))
-
-        # For all non-zero mergables, see if there is not another one with
-        # overlap. If so, only use the larges list.
-        dd = self.get_linear_solution(cand)
-
-    def get_mergable_patches_onepatch(self, cand, fitpatch, offstd=100.0,
-            mergetol=2.0):
-        """Given a candidate and a patch, return potential mergable patches
-
-        Given a candidate solution, and a patch number, use prediction to see
-        which coherence patches are within a coherence length, so that they can
-        be merged.
-        
-        NOTE: the candidate solution is already assumed to be in a (local)
-              maximum of the likelihood. Otherwise, the extrapolation does not
-              make sense
+        The merge_pvals tree consists of n-1 list elements (n = # patches) of
+        p-value lists (list of lists). The i-th element describes the merge of
+        patch i and i+1, where the various p-values at this location describe
+        jumps of relative phase number
 
         :param cand:
             CandidateSolution candidate
 
-        :param fitpatch:
-            Patch number we are fitting to
-
-        :param offstd:
-            When using `fitpatch`, this parameter sets the width of the prior on
-            the jump/offset of all patches
-
-        :param mergetol"
-            How much larger the prediction uncertainty can be than the pulse
-            period for us to still include a merge (potentially with a phase
-            jump)
-
-        :return:
-            patch indices
+        :param minpval:
+            The minimum p-value to include in the proposals of the relative
+            phase jumps
         """
-        dd = self.get_linear_solution(cand, fitpatch=fitpatch, offstd=offstd)
-        P0 = 1.0 / self._psr['F0'].val
-        obsns = np.where(dd['stdrp'] < mergetol*P0)[0]
-        mergepatches = []
+        patches = cand.get_patches()
+        oii = cand.obs_inds_inv
+        np = len(patches)
+        P0 = float(1.0 / self._psr['F0'].val)
 
-        so = set(obsns)
-        for ii, patch in enumerate(cand.get_patches()):
-            sp = set(patch)
-            if ii != fitpatch and len(set.intersection(so, sp)) > 0:
-                mergepatches.append(ii)
+        merge_pvals = [[] for ii in range(np-1)]    # List of lists
+        for ii, mpv in enumerate(merge_pvals):
+            # Merging patch ii and ii+1. Get the p-values
+            dd = self.perform_linear_least_squares_fit(cand, fitpatch=ii,
+                offstd=offstd)
+            next_obs = patches[ii+1][0]         # First obs next patch
+            std = dd['stdrp'][oii[next_obs]]    # Prediction spread
+            rps = 0                             # Relative phase shift
+            pval = 1.0
+            while pval > minpval:
+                # Symmetric for positive and negative phase shifts
+                left, right = rps-0.5, rps+0.5
+                lpval = sst.norm.cdf(left, loc=0.0, scale=std/P0)
+                rpval = sst.norm.cdf(right, loc=0.0, scale=std/P0)
+                pval = rpval-lpval
+                #print("pvals: ", lpval, rpval, pval, left, right, std/P0)
 
-        return mergepatches
+                if pval > minpval:
+                    mpv.append(pval)
+                    if rps > 0:             # Add the negative p-val one as well
+                        mpv.insert(0, pval)
+
+                rps += 1
+
+        return merge_pvals
 
     def get_jump_designmatrix(self, cand, fitpatch=None):
         """Obtain the design matrix of inter-coherence-patch jumps
@@ -414,7 +390,7 @@ class PulsarSolver(object):
         for pp, patch in enumerate(patches):
             Mj[patch,pp] = True
 
-        return Mj
+        return Mj[cand.obs_inds,:]
 
     def get_jump_designmatrix_onepatch(self, cand, fitpatch=None):
         """Obtain the design matrix of one inter-coherence-patch jump
@@ -431,7 +407,7 @@ class PulsarSolver(object):
             Mj[patch,0] = True
         else:
             Mj = np.zeros((self.nobs, 0))
-        return Mj
+        return Mj[cand.obs_inds,:]
 
     def get_jump_Gmatrix(self, cand, fitpatch=None):
         """Obtain the complement/G-matrix of get_jump_designmatrix
@@ -452,7 +428,7 @@ class PulsarSolver(object):
         add_fitpatch_cols = 0 if fitpatch is None else 1
 
         npatches = len(patches)
-        Gj = np.zeros((self.nobs, self.nobs-npatches+add_fitpatch_cols))
+        Gj = np.zeros((self.nobs, cand.nobs-npatches+add_fitpatch_cols))
         ind = 0
         for pp, patch in enumerate(patches):
             ngsize = len(patch)
@@ -466,7 +442,7 @@ class PulsarSolver(object):
                     Gj[idind,ind] = True
                     ind += 1
 
-        return Gj
+        return Gj[cand.obs_inds,:]
 
     def get_Gmatrix_onepatch_an(self, n):
         """For a single coherent patch, return the G-matrix
@@ -527,9 +503,7 @@ class PulsarSolver(object):
         """For a single coherent patch, return the G-matrix
 
         For a single coherent patch, return the G-matrix that is orthogonal to
-        the patch jump designmatrix
-
-        TODO: Do this analytical, not with an SVD
+        the patch jump designmatrix. Faster than analytical for n<15000 or so.
         """
         pvec = np.ones((ngsize, 1))
         U, s, Vt = sl.svd(pvec)
@@ -605,7 +579,41 @@ class PulsarSolver(object):
 
         return dt[selection]
 
-    def toas(self, cand, exclude_nonconnected=False):
+    def pulsenumbers(self, cand, exclude_nonconnected=False):
+        """Return the pulse numbers relative to the PEPOCH
+
+        Given a candidate solution, return the pulse numbers, relative to the
+        PEPOCH, adjusted for the relative phase jumps in the candidate solution
+
+        :param cand:
+            The candidate solution object
+
+        :param exclude_nonconnected:
+            If True, only return resiudals within coherent patches with more
+            than one residual
+        """
+        # Obtain the residuals as tempo2 would calculate them
+        self._psr.vals(which='fit', values=cand.pars)
+        pn_lt = self._psr.pulsenumbers(updatebats=True,
+                formresiduals=True, removemean=False)[self._isort]
+        pn = pn_lt.copy()
+
+        selection = np.array([], dtype=np.int) if exclude_nonconnected \
+                                               else np.arange(len(pn))
+        rpns = cand.get_rpns()
+        patches = cand.get_patches()
+        for pp, patch in enumerate(patches):
+            # Relative pulse numbers of patch, and from tempo2
+            rpn = np.array(rpns[pp])
+            rpn_lt = pn_lt[patch] - pn_lt[patch[0]]
+            pn[patch] += (rpn - rpn_lt)
+
+            if exclude_nonconnected and len(patch) > 1:
+                selection = np.append(selection, patch)
+
+        return pn[selection]
+
+    def toas(self, cand=None, exclude_nonconnected=False):
         """Return the toas, possibly excluding non-connected toas
 
         Return the toas. If exclude_nonconnected is True, then only return the
@@ -621,12 +629,14 @@ class PulsarSolver(object):
             If True, only return resiudals within coherent patches with more
             than one residual
         """
-        self._psr.vals(which='fit', values=cand.pars)
+        if cand is not None:
+            self._psr.vals(which='fit', values=cand.pars)
+
         toas = self._psr.toas(updatebats=True)[self._isort]
         selection = np.array([], dtype=np.int) if exclude_nonconnected \
                                                else np.arange(len(toas))
 
-        if exclude_nonconnected:
+        if exclude_nonconnected and cand is not None:
             patches = cand.get_patches()
             for pp, patch in enumerate(patches):
                 # Only return if requested
@@ -635,7 +645,7 @@ class PulsarSolver(object):
 
         return toas[selection]
 
-    def toaerrs(self, cand, exclude_nonconnected=False):
+    def toaerrs(self, cand=None, exclude_nonconnected=False):
         """Return the toa uncertainties, possibly excluding non-connected toas
 
         Return the uncertainties. If exclude_nonconnected is True, then only
@@ -656,7 +666,7 @@ class PulsarSolver(object):
         selection = np.array([], dtype=np.int) if exclude_nonconnected \
                                                else np.arange(len(toaerrs))
 
-        if exclude_nonconnected:
+        if exclude_nonconnected and cand is not None:
             patches = cand.get_patches()
             for pp, patch in enumerate(patches):
                 # Only return if requested
@@ -698,37 +708,36 @@ class PulsarSolver(object):
         return M[selection,:]
 
 
-    def get_chi2_pvalue(self, cand):
-        """Return the chi2 p-value for this candidate solution
+    def get_chi2_pvalue(self, dd):
+        """Return the chi2 p-value for this solve
 
-        For the provided candidate solution, calculate the p-value of the chi^2
-        distribution, properly correcting for the number of degrees of freedom.
-        We are doing a one-sided test here.
+        For the provided linear solution, calculate the chi2 and p-value,
+        properly correcting for the number of degrees of freedom.  We are doing
+        a one-sided test here.
 
         The chi2 we are calculating is from the likelihood:
         xi^2 =  (dt - M ksi)^T N^{-1} (dt - M ksi)
 
         Where dt, N, and M are projected with the G-matrix
 
-        :param cand:
-            The candidate solution object
+        :param dd:
+            The linear solution
         """
-        dd = self.get_linear_solution(cand)
         dt = dd['dtp']
         M = dd['Mp']
         N_cf = dd['Np_cf']
-        ksi = cand.pars
 
         # We calculate the p-value from chi2 and the degrees of freedom. If
         # dof=0, the p-value equals 1 (no discrepancy).
         dof = max(len(dt)-M.shape[1], 0)
         pval = 1.0
+        chi2 = 1.0
 
         if dof > 0:
-            xi2 = np.dot(dt, sl.cho_solve(N_cf, dt))
-            pval = sst.chi2.sf(xi2, dof)
+            chi2 = float(np.dot(dt, sl.cho_solve(N_cf, dt)))
+            pval = sst.chi2.sf(chi2, dof)
 
-        return pval
+        return chi2, dof, pval
 
     def fit_constrained_iterative(self, cand, lltol=0.1, maxiter=10,
             offstd=100.0):
@@ -817,7 +826,8 @@ class PulsarSolver(object):
             the jump/offset of all patches
         """
         dd = dict()
-        nobs = self.nobs
+        nobs = cand.nobs
+        obs_inds = cand.obs_inds
 
         newcand, cmask = self.make_pars_respect_constraints(cand,
                 ass_cmin, ass_cmax)
@@ -828,7 +838,7 @@ class PulsarSolver(object):
         # we need the uncertainty of the offset when doing prediction.
         Mj = self.get_jump_designmatrix(newcand, fitpatch=fitpatch)
         Mo = np.ones((nobs, 0 if fitpatch is None else 1))
-        Mt = self.designmatrix(newcand)[:,cmask]
+        Mt = self.designmatrix(newcand)[:,cmask][obs_inds]
         Mtot = np.append(Mt, Mo, axis=1)
         Gj = self.get_jump_Gmatrix(newcand, fitpatch=fitpatch)
         
@@ -841,7 +851,7 @@ class PulsarSolver(object):
         nparj = Mj.shape[1]
 
         # Create the noise and prior matrices
-        Nvec = self.toaerrs(newcand)**2
+        Nvec = self.toaerrs(newcand)[obs_inds]**2
         Phivect = np.array([self._prerr[key]**2 for key in self._prerr])[cmask]
         Phiveco = np.array([offstd/self._psr['F0'].val]*Mo.shape[1])**2
         Phivec = np.append(Phivect, Phiveco)
@@ -856,7 +866,7 @@ class PulsarSolver(object):
         phipar = prpars_delta * Phivec_inv  # Instead of: phipar = prpars * Phivec_inv
 
         # Set psr parameters, and remove the phase offsets of the patches
-        dt_lt = self.residuals(newcand)
+        dt_lt = self.residuals(newcand)[obs_inds]
         dt, jvals = self.subtract_jumps(dt_lt, Mj, Nvec)
 
         if nparj == nobs:
@@ -883,13 +893,22 @@ class PulsarSolver(object):
             Mp = np.dot(Gj.T, Mtot)
             dtp = np.dot(Gj.T, dt)
             Np = np.dot(Gj.T * Nvec, Gj)
-            Np_cf = sl.cho_factor(Np)
+            try:
+                Np_cf = sl.cho_factor(Np)
+            except np.linalg.LinAlgError as err:
+                print("Np = ", Np)
+                raise
             MNM = np.dot(Mp.T, sl.cho_solve(Np_cf, Mp))
             Sigma_inv = MNM + np.diag(Phivec_inv)
 
             # TODO: Use regularized Mtot??
-            Sigma_inv_cf = sl.cho_factor(Sigma_inv)
-            Sigma = sl.cho_solve(Sigma_inv_cf, np.eye(len(MNM)))
+            try:
+                Sigma_inv_cf = sl.cho_factor(Sigma_inv)
+                Sigma = sl.cho_solve(Sigma_inv_cf, np.eye(len(MNM)))
+            except np.linalg.LinAlgError as err:
+                print("Sigma_inv = ", Sigma_inv)
+                np.savetxt('Sigma_inv.txt', Sigma_inv)
+                raise
 
             # Calculate the prediction quantities
             MNt = np.dot(Mp.T, sl.cho_solve(Np_cf, dtp))
@@ -900,16 +919,16 @@ class PulsarSolver(object):
             # Calculate the log-likelihood
             logdetN2 = np.sum(np.log(np.diag(Np_cf[0])))
             logdetphi2 = 0.5*np.sum(np.log(Phivec))
-            xi2dt = 0.5*np.dot(dtp, sl.cho_solve(Np_cf, dtp))
-            xi2phi = 0.5*np.sum(prpars_delta**2/Phivec)
-            xi2phi1 = 0.5*np.dot(dpars, np.dot(Sigma_inv, dpars))
-            xi2_active = 0.5*np.dot(dpars, np.dot(Sigma_inv, dpars))
-            # NOTE: xi2_active is zero _if_ we move to ML solution. We are dpars
+            chi2dt = 0.5*np.dot(dtp, sl.cho_solve(Np_cf, dtp))
+            chi2phi = 0.5*np.sum(prpars_delta**2/Phivec)
+            chi2phi1 = 0.5*np.dot(dpars, np.dot(Sigma_inv, dpars))
+            chi2_active = 0.5*np.dot(dpars, np.dot(Sigma_inv, dpars))
+            # NOTE: chi2_active is zero _if_ we move to ML solution. We are dpars
             #       away from there. That's why we subtract it from loglik.
-            #       Note also that, now, xi2phi1 and zi2_active are the same in
+            #       Note also that, now, chi2phi1 and zi2_active are the same in
             #       this rescaling
-            loglik = -logdetN2-logdetphi2-xi2dt-xi2phi+xi2phi1-xi2_active
-            loglik_ml = -logdetN2-logdetphi2-xi2dt-xi2phi+xi2phi1
+            loglik = -logdetN2-logdetphi2-chi2dt-chi2phi+chi2phi1-chi2_active
+            loglik_ml = -logdetN2-logdetphi2-chi2dt-chi2phi+chi2phi1
         else:
             raise ValueError("# of patches is higher than # of observations")
 
@@ -962,11 +981,71 @@ class PulsarSolver(object):
             the jump/offset of all patches
 
         Use the G-matrix formalism
+
+        TODO: DEPRECATED. Just use perform_linear_least_squares_fit
         """
         dd = self.perform_linear_least_squares_fit(cand, fitpatch=fitpatch,
                 offstd=offstd)
         return dd
 
+    def solve(self):
+        """Solve the pulsar hierarchically.
+
+        Solve the pulsar hierarchically using the candidate tree. Do not explore
+        options with a prior probability of less than min_pval.
+        """
+        # Root_cand is the root of the entire candidate tree
+        root_cand = CandidateSolution()
+        root_cand.set_start_solution(self, pars=None)
+        root_cand.integrate_in_tree()
+
+        cand_by_pval = [root_cand]      # This will be a sorted 
+        cur_cand = root_cand
+
+        prop_hist = dict()      # Full proposal history to prevent duplicates
+        prop_hist[cur_cand.get_history_hashable()] = True
+
+        counter = 0
+        while not cur_cand.is_coherent() and counter<50:
+            # Optimize the next proposed candidate solution (constrained fit)
+            cur_cand = cand_by_pval.pop()       # Largest p-value is popped
+
+            new_cand, loglik = self.fit_constrained_iterative(cur_cand)
+            cur_cand.pars = new_cand.pars
+            print("Trying: " + ', '.join(cur_cand.get_history()))
+
+            # Perform an unconstrained fit for p-values, and get stats
+            dd = self.perform_linear_least_squares_fit(cur_cand)
+            chi2, dof, pval = self.get_chi2_pvalue(dd)
+            pulse_numbers = self.pulsenumbers(cur_cand)
+
+            # Get the tree of merge p-values of children
+            merge_pvals = self.get_merge_pvals(cur_cand, minpval=0.01)
+
+            # Register all this information
+            cur_cand.register_optimized_results(chi2, dof, merge_pvals)
+
+            # Add candidates from parent (delete or rpn shifts)
+            additions = []
+            if cur_cand.is_parent_rpn_trigger():
+                rpn, p1, p2 = cur_cand.get_origin_patches()
+                additions += cur_cand._parent.notify_patches_merged(
+                        rpn, p1, p2, self.delete_prob, pulse_numbers)
+
+            # Add candidates from cur_cand (only rpn = 0 initially)
+            additions += cur_cand.initialize_children_rpn0(pulse_numbers)
+
+            # Add all additions into the cand_by_pval sorted list
+            for addition in additions:
+                hist = addition.get_history_hashable()
+                if not hist in prop_hist:
+                    ind = bisect.bisect_right(cand_by_pval, addition)
+                    cand_by_pval.insert(ind, addition)
+                    prop_hist[hist] = True
+
+            counter += 1
+
+        return root_cand, cand_by_pval
 
 class CandidateSolution(object):
     """
@@ -993,20 +1072,127 @@ class CandidateSolution(object):
         self._pars = []
         self._patches = []
         self._rpn = []
+        self._psob = None
 
         # Tree references
         self._parent = None                 # Parent solution
         self._delete_children = []          # Children through deletion
+        self._delete_history = []              # Indices deleted observations
         self._merge_children = []           # Children through patch-mergers
 
         # P-values
         self._delete_pvals_hist = []        # History of deletion p-values
-        self._parent_chi2pval = None        # Chi2 p-value of parent
-        self._proposed_pval = None          # Prior-proposal probability
-        self._origin = "root"               # Proposal origin
-        self._chi2 = None                   # Chi2 value of current solution
-        self._dof = None                    # Chi2 degrees of freedom
-        self._child_merge_pvals = None      # All children merge prior pvals
+        self._parent_chi2pval = 1.0         # Chi2 p-value of parent
+        self._proposed_pval = 1.0           # Prior-proposal probability
+        self._origin = ("root",)            # Proposal origin
+        self._chi2 = 1.0                    # Chi2 value of current solution
+        self._dof = 0                       # Chi2 degrees of freedom
+        self._child_merge_pvals = []        # All children merge prior pvals
+        self._hist_pval = None              # Priority p-value due to history
+
+    def set_start_solution(self, psob, pars=None, patches=None, rpn=None):
+        """Set the start solution
+
+        Set the starting solution
+
+        :param psob:
+            The PulsarSolver object we start from
+
+        :param pars:
+            Start parameters. If None, obtain from psob prior
+        """
+        self._psob = psob
+        if pars is None:
+            pars = np.array([psob._prpars[key] for key in psob._prpars])
+
+        self._pars = pars
+        nobs = len(psob.toas())
+
+        if patches is None or rpn is None:
+            self.init_separate_patches(nobs)
+        else:
+            self.set_patches(patches, rpn)
+
+    def copy_from_object(self, copyobject):
+        """Copy all the information from an object into this one.
+
+        Copy all the information from an object into this one. This object will
+        be an orphan: the parent/child information is not copied.
+
+        :param copyobject:
+            The CandidateSolution object to copy stuff from
+        """
+        self._pars = copy.deepcopy(copyobject._pars)
+        self._rpn = copy.deepcopy(copyobject._rpn)
+        self._patches = copy.deepcopy(copyobject._patches)
+        self._psob = copyobject._psob   # Shallow copy of course
+
+    def __eq__(self, other):
+        """Compare p-values == """
+        if isinstance(other, CandidateSolution):
+            return self.pval == other.pval
+        return NotImplemented
+
+    def __ne__(self, other):
+        """Compare p-values != """
+        result = self.__eq__(other)
+        if result is NotImplemented:
+            return result
+        return not result
+
+    def __gt__(self, other):
+        """Compare p-values >"""
+        if isinstance(other, CandidateSolution):
+            return self.pval > other.pval
+        return NotImplemented
+
+    def __ge__(self, other):
+        """Compare p-values >="""
+        if isinstance(other, CandidateSolution):
+            return self.pval >= other.pval
+        return NotImplemented
+
+    def __lt__(self, other):
+        """Compare p-values <"""
+        if isinstance(other, CandidateSolution):
+            return self.pval < other.pval
+        return NotImplemented
+
+    def __le__(self, other):
+        """Compare p-values <="""
+        if isinstance(other, CandidateSolution):
+            return self.pval <= other.pval
+        return NotImplemented
+
+    def have_child_phase_shift_pval(self, rpnshift, pi1, pi2):
+        """Return True if we have the p-value for this phase shift in memory
+
+        Return True if we have the p-value for this phase shift in memory
+
+        :param rpnshift:
+            The integer shift in relative phase between patch pi1 and pi2
+
+        :param pi1:
+            Index of coherence patch 1
+
+        :param pi2:
+            Index of coherence patch 2. Must be pi+1 or pi-1, since we are only
+            merging adjacent coherence patches...
+        """
+        if not pi2 in [pi1+1, pi1-1]:
+            raise ValueError("Can only merge adjacent coherent patches")
+        
+        # Sort the indices and determine the order of the tree
+        pi1, pi2 = (pi1, pi2) if pi1 < pi2 else (pi2, pi1)
+        tree_index = pi1
+        order = np.abs(rpnshift)
+        nelements = 2*order+1
+
+        rv = True
+        if len(self._child_merge_pvals[pi1]) < nelements:
+            rv = False
+
+        return rv
 
     def get_child_index_from_phase_shift(self, rpnshift, pi1, pi2):
         """Get the child-index for a particular proposed phase shift
@@ -1024,7 +1210,7 @@ class CandidateSolution(object):
             Index of coherence patch 2. Must be pi+1 or pi-1, since we are only
             merging adjacent coherence patches...
         """
-        if not pi2 in [pi+1, pi-1]:
+        if not pi2 in [pi1+1, pi1-1]:
             raise ValueError("Can only merge adjacent coherent patches")
         
         # Sort the indices and determine the order of the tree
@@ -1054,15 +1240,17 @@ class CandidateSolution(object):
         """
         if order<0:
             raise ValueError("Order of the tree must be >= 0")
+        if len(self._merge_children) == 0:
+            self._merge_children = [[] for ii in range(len(self._patches)-1)]
         mclen = len(self._merge_children[tree_index])
         nelements = 2*order+1
         if mclen == 0:
-            self._merge_children = [None] * nelements
+            self._merge_children[tree_index] = [None] * nelements
         elif (mclen-1) % 2 == 0:
             # Grow properly
             while mclen < nelements:
-                self._merge_children.append(None)
-                self._merge_children.insert(0, None)
+                self._merge_children[tree_index].append(None)
+                self._merge_children[tree_index].insert(0, None)
                 mclen += 2
         else:
             raise ValueError("_merge_children not grown properly")
@@ -1087,20 +1275,26 @@ class CandidateSolution(object):
         inds = np.where(nop == 1)[0]
         return inds[sspind]
 
-    def copy_from_object(self, copyobject):
-        """Copy all the information from an object into this one.
+    def get_sspind_from_patchind(self, pind):
+        """Return the sspind, given the patch index
 
-        Copy all the information from an object into this one. This object will
-        be an orphan: the parent/child information is not copied.
+        Return the single-point patch index, given the patch index
 
-        :param copyobject:
-            The CandidateSolution object to copy stuff from
+        :param pind:
+            The index of the patch
         """
-        self._pars = copy.deepcopy(copyobject._pars)
-        self._rpn = copy.deepcopy(copyobject._rpn)
-        self._patches = copy.deepcopy(copyobject._patches)
+        nop = np.array([len(patch) for patch in self._patches])
+        pmsk = np.zeros(len(self._patches), dtype=np.bool)
+        pmsk[pind] = True
+        comb = np.logical_and(nop == 1, pmsk)
 
-    def integrate_in_tree(self, origin, parent, parent_chi2pval, proposed_pval):
+        if not np.sum(comb) == 1:
+            raise ValueError("{0} not an single-point patch".format(pind))
+
+        return np.where(comb)[0][0]
+
+    def integrate_in_tree(self, origin=('root',), parent=None,
+            parent_chi2pval=1.0, proposed_pval=1.0):
         """Integrate this solution in the candidate solution tree
 
         Integrate this solution in the candidate solution tree, and have the
@@ -1110,7 +1304,7 @@ class CandidateSolution(object):
 
         :param origin:
             What the origin of this candidate solution is. Available options are
-            'root', ('delete', patch_ind), (rpn_shift, (patch_ind1, patch_ind2))
+            ('root',), ('delete', patch_ind), ('rps', rpn_shift, patch_ind1, patch_ind2)
 
         :param parent:
             Reference to the parent object
@@ -1122,9 +1316,9 @@ class CandidateSolution(object):
             The p-value of this candidate, prior to evaluation/optimization
         """
         if origin == 'root':
-            self._origin = 'root'
+            self._origin = ('root',)
             self._parent = None
-            self._parent_chi2pval = None
+            self._parent_chi2pval = 1.0
         else:
             self._origin = origin
             self._parent = parent
@@ -1132,24 +1326,144 @@ class CandidateSolution(object):
             self._proposed_pval = proposed_pval
 
             if origin[0] == 'delete':
-                # Deleted point
-                self._parent._delete_children[origin[1]] = self
+                # Deleted point is always initiated from the parent
                 self._delete_pvals_hist.append(proposed_pval)
             else:
                 # It's a relative pulse-number shift
-                merge_ind = k blah
-                self._parent._merge_children blah
+                # TODO: FIX THISSS!!!
+                #merge_ind = k blah
+                #self._parent._merge_children blah
+                pass
 
         self._delete_children = [None] * self.get_ssp_len()
-        self._merge_children = [[]] * (len(self._patches)-1)
+        self._merge_children = [[] for ii in range(len(self._patches)-1)]
 
-    def set_start_solution(self, pars, nobs, patches=None, rpn=None):
-        self._pars = pars
+    def initialize_children_rpn0(self, pulse_numbers):
+        """This candidate has just been created. Create rpn=0 children
 
-        if patches is None or rpn is None:
-            self.init_separate_patches(nobs)
-        else:
-            self.set_patches(patches, rpn)
+        This candidate has just been created. Create candidate solutions for
+        patch joining, all with relative phase shift = 0
+
+        :param pulse_numbers:
+            The pulse numbers, relative to the PEPOCH
+        """
+        add = []
+        # There are only npatch-1 joins possible
+        for pind1, patch in enumerate(self._patches[:-1]):
+            pind2 = pind1+1
+            child_ind = self.get_child_index_from_phase_shift(0, pind1, pind2)
+            if self.have_child_phase_shift_pval(0, pind1, pind2):
+                add.append(self.add_proposal_candidate_rpn(0, pind1, pind2,
+                        pulse_numbers))
+
+        return add
+
+    def notify_patches_merged(self, rpn, pind1, pind2, delete_pvals,
+            pulse_numbers):
+        """Patches pind1, pind2 have merged. Deal with it.
+
+        Patches pind1, pind2 have merged. Deal with it by adding the option to
+        delete these patches if they are single-point patches.
+
+        :param rpn:
+            Relative phase number that was evaluated
+
+        :param pind1:
+            Index of patch 1
+
+        :param pind2:
+            Index of patch 2
+
+        :param delete_pvals:
+            Deletion prior probabilities of all the observations
+
+        :param pulse_numbers:
+            The pulse numbers, relative to the PEPOCH
+        """
+        pind1, pind2 = (pind1, pind2) if pind1 < pind2 else (pind2, pind1)
+        add = []
+        # Deletion of patch 1
+        if rpn==0 and len(self._patches[pind1]) == 1:
+            add.append(self.add_proposal_candidate_delete(pind1, delete_pvals))
+
+        # Deletion of patch 2
+        if rpn==0 and len(self._patches[pind2]) == 1:
+            add.append(self.add_proposal_candidate_delete(pind2, delete_pvals))
+
+        # Relative phase shift expansion
+        neworder = np.abs(rpn)+1
+        for rps in [-neworder, neworder]:
+            child_ind = self.get_child_index_from_phase_shift(rps, pind1, pind2)
+            if self._merge_children[pind1][child_ind] is None and \
+                    self.have_child_phase_shift_pval(rps, pind1, pind2):
+                add.append(self.add_proposal_candidate_rpn(rps, pind1, pind2,
+                        pulse_numbers))
+
+        return add
+
+    def add_proposal_candidate_delete(self, pind, delete_pvals):
+        """Add the proposal to delete patch number pind
+
+        Add the proposal to delete patch number pind to the tree
+
+        :param pind:
+            Index number of the patch
+
+        :param delete_pvals:
+            Deletion prior probabilities of all the observations
+        """
+        sspind = self.get_sspind_from_patchind(pind)
+
+        newcand = CandidateSolution(self)
+        temp = newcand._patches.pop(pind)
+        origin = ('delete', pind)
+        chi2, dof = self._chi2, self._dof
+        parent_chi2pval = sst.chi2.sf(chi2, dof) if dof > 0 else 1.0
+        proposed_pval = delete_pvals[self._patches[pind][0]]
+        newcand.integrate_in_tree(origin, self, parent_chi2pval, proposed_pval)
+
+        self._delete_children[sspind] = newcand
+
+        # Add the deleted observation to the history present in newcand
+        obsind = self._patches[sspind][0]
+        ind = bisect.bisect_left(newcand._delete_history, obsind)
+        newcand._delete_history.insert(ind, obsind)
+
+        return newcand
+
+    def add_proposal_candidate_rpn(self, rps, pind1, pind2, pulse_numbers):
+        """Add the proposal to perform relative phase shifts between patch 1&2
+
+        Add the proposal to shift the phase between patch pind1 and patch pind2
+
+        :param rps:
+            Relative phase shift
+
+        :param pind1:
+            Index number of patch 1
+
+        :param pind2:
+            Index number of patch 2
+
+        :param pulse_numbers:
+            The pulse numbers, relative to the PEPOCH
+        """
+        pind1, pind2 = (pind1, pind2) if pind1 < pind2 else (pind2, pind1)
+        newcand = CandidateSolution(self)
+
+        newcand.join_patches(pind1, pind2, pulse_numbers, rpnjump=rps)
+        origin = ('rps', rps, pind1, pind2)
+
+        ch_index = self.get_child_index_from_phase_shift(rps, pind1, pind2)
+
+        chi2, dof = self._chi2, self._dof
+        parent_chi2pval = sst.chi2.sf(chi2, dof) if dof > 0 else 1.0
+        proposed_pval = self._child_merge_pvals[pind1][ch_index]
+        newcand.integrate_in_tree(origin, self, parent_chi2pval, proposed_pval)
+
+        self._merge_children[pind1][ch_index] = newcand
+
+        return newcand
 
     def init_separate_patches(self, nobs):
         """Initialize the individual coherence patches
@@ -1211,6 +1525,17 @@ class CandidateSolution(object):
             patches = self._patches[:fitpatch] + self._patches[(fitpatch+1):]
         return patches
 
+    def get_origin_patches(self):
+        """Return the rpn and patches ids merged in order to get this solution
+
+        Return the relative phase number and the patch numbers that were merged
+        in the parent in order to get this solution
+        """
+        if self._origin[0] == 'rps':
+            return (self._origin[1], self._origin[2], self._origin[3])
+        else:
+            return NotImplemented
+
     def get_number_of_toas(self, exclude_nonconnected=False):
         """Get the number of toas, possibly excluding non-connected epochs
 
@@ -1219,7 +1544,8 @@ class CandidateSolution(object):
         """
         ntoas = 0
         for pp, patch in enumerate(self._patches):
-            ntoas += len(patch) if len(patch) > 1 else 0
+            ntoas += len(patch) if len(patch) > 1 or \
+                    not exclude_nonconnected else 0
 
         return ntoas
 
@@ -1232,14 +1558,13 @@ class CandidateSolution(object):
             rpn = self._rpn[:fitpatch] + self._rpn[(fitpatch+1):]
         return rpn
 
-    def regisger_optimized_results(self, pars, chi2, dof, child_merge_pvals):
+    def register_optimized_results(self, chi2, dof, child_merge_pvals):
         """After running an optimizer on this candidate, register the results
 
         After running an optimizer on this candidate, register all the
-        probability results, so we can initialize children
-
-        :param pars:
-            Parameters found by the optimizer
+        probability results, so we can initialize children. If this is
+        merged-patch solution with zero relative phase, also create the option
+        to delete the point in the parent.
 
         :param chi2:
             Chi^2 value of the solution
@@ -1252,11 +1577,136 @@ class CandidateSolution(object):
             Gaussian process approximation. The tree is 'only' populated up to
             some lowest p-value
         """
-        self.pars = pars
         self._chi2 = chi2
         self._dof = dof
         self._child_merge_pvals = child_merge_pvals
-        
+
+    def is_parent_delete_trigger(self):
+        """Returns true when the parent needs a delete addition when evaluated
+
+        This function returns True when we need to notify the parent when this
+        candidate is evaluated. This happens when we are a '0' relative phase
+        candidate, are evaluated, and we have a parent.
+        """
+        rv = False
+        if self._origin[0] == 'rps' and self._origin[1] == 0:
+            rv = True
+        return rv
+
+    def is_parent_rpn_trigger(self):
+        """Returns true when the parent might need rpn additions when evaluated
+
+        This function returns True when the parent needs to be notified when we
+        evaluate this candidate. This happens when we are non-root, and we are a
+        relative phase shift.
+        """
+        rv = False
+        if self._origin[0] == 'rps':
+            rv = True
+        return rv
+
+    def get_root_map(self, inds):
+        """Get the mapping from current patch id, to root patch id
+
+        Due to the deletion of observation, and the merging of patches, the
+        current patch id's do not correspond to observations anymore. This
+        function returns the mapping of the current patches to the original
+        observations in root
+        """
+        inds = np.atleast_1d(inds)
+        if self._origin[0] == 'root':
+            mapping = inds
+        else:
+            parent_inds = self._parent.map_from_child(inds, self._origin)
+            mapping = self._parent.get_root_map(parent_inds)
+
+        return mapping
+
+    def map_from_child(self, inds, origin):
+        """Given indices from a child, map to this candidate
+
+        Given the patch indices from a child, map those indices to this
+        candidate. Handy for recursive use
+
+        :param inds:
+            Indices of the child (numpy array)
+
+        :param origin:
+            Description of what happened from here to the child
+        """
+        if origin[0] == 'delete':
+            dp = origin[1]
+            newinds = inds.copy()
+            newinds[dp:] += 1
+        elif origin[0] == 'rps':
+            # Phase shifting is just like deleting a patch
+            dp = origin[3]
+            newinds = inds.copy()
+            newinds[dp:] += 1
+        elif origin[0] == 'root':
+            # This should never happen!
+            newinds = inds
+        return newinds
+
+    def get_history(self):
+        """Obtain the history of this candidate
+
+        Obtain the history of this candidate as a list of origins.
+
+        TODO: This is still an O(n^2) procedure
+        TODO: DEBUG THIS!!!!
+        """
+        hist = []
+        # First get the full history trace of the parent
+        if self._origin[0] != 'root':
+            hist += self._parent.get_history()
+            mapping = self._parent.get_root_map(np.arange(len(self._parent._patches)))
+
+        if self._origin[0] == 'root':
+            hist += ['r']
+        elif self._origin[0] == 'delete':
+            obsind = mapping[self._origin[1]]
+            hist += ['d-'+str(obsind)]
+        elif self._origin[0] == 'rps':
+            obsind = mapping[self._origin[3]]
+            hist += ['s-'+str(obsind)]
+        else:
+            raise NotImplementedError("{0} not an origin ID".self._origin[0])
+
+        return hist
+
+    def get_history_str(self):
+        """Return a string of the history of this candidate"""
+        return ', '.join(self.get_history())
+
+    def get_history_hashable(self):
+        first = str([patch for patch in self._patches if len(patch) > 1])
+        second = str([rpn for rpn in self._rpn if len(rpn) > 1])
+        third = str(self._delete_history)
+        return first+second+third
+
+    def get_history_len(self, count_del=False):
+        """Return the length of the history
+
+        Return how many times we have iterated this candidate
+
+        :param cound_del:
+            Whether or not we count deletion as an iteration
+        """
+        parent = self
+        length = 1
+        while parent._origin[0] != 'root':
+            if count_del or parent._origin[0] != 'delete':
+                length += 1
+
+            parent = parent._parent
+
+        return length
+
+    def is_coherent(self):
+        """Is this candidate solution coherent?"""
+        #TODO: We should do proper checking of chi2 values and shit
+        return len(self._patches) == 1
 
     @property
     def pars(self):
@@ -1269,3 +1719,34 @@ class CandidateSolution(object):
     @property
     def npars(self):
         return len(self.pars)
+
+    @property
+    def pval(self):
+        return self._proposed_pval * self._parent_chi2pval * self.hist_pval
+
+    @property
+    def hist_pval(self):
+        if self._hist_pval is None:
+            self._hist_pval = np.log2(self.get_history_len()+1)
+        return self._hist_pval
+
+    @property
+    def nobs(self):
+        return self.get_number_of_toas(exclude_nonconnected=False)
+
+    @property
+    def obs_inds(self):
+        """The candidate has deleted points. So we need to map from shorter list
+        to longer list
+        """
+        return np.array(sum(self._patches, []), dtype=np.int)
+
+    @property
+    def obs_inds_inv(self):
+        """This is the inverse mapping of 'obs_inds'
+        """
+        obs_inds = self.obs_inds
+        rv = np.zeros(np.max(obs_inds)+1)
+        for ii, p in enumerate(obs_inds):
+            rv[p] = ii
+        return rv
