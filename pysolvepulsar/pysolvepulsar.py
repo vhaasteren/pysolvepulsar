@@ -16,6 +16,7 @@ import libstempo as lt
 import os, glob, sys
 import copy
 import bisect
+import rankreduced as rrd
 
 try:
     from collections import OrderedDict
@@ -23,13 +24,16 @@ except ImportError:
     from ordereddict import OrderedDict
 
 # Parameters that have tempo2 status as parameter, but are not model parameters
-tempo2_excludepars = ['START', 'FINISH', 'PEPOCH', 'POSEPOCH', 'DMEPOCH', 'EPHVER']
+tempo2_excludepars = ['START', 'FINISH', 'PEPOCH', 'POSEPOCH', 'DMEPOCH',
+                      'EPHVER', 'TZRMJD', 'TZRFRQ', 'TRES']
 
 # Parameters that are not always required to be fit for
 tempo2_nonmandatory = ['DM']
 
 # Parameter bounds (min, max):
 tempo2_parbounds = {'F0': (0.0, np.inf),
+                    'RAJ': (0.0, 2*np.pi),
+                    'DECJ': (-0.5*np.pi, 0.5*np.pi),
                     'SINI': (0.0, 1.0),
                     'ECC': (0.0, 1.0),
                     'E': (0.0, 1.0)
@@ -344,14 +348,14 @@ class PulsarSolver(object):
         np = len(patches)
         P0 = float(1.0 / self._psr['F0'].val)
 
-        merge_pvals = [[] for ii in range(np-1)]    # List of lists
+        merge_pvals = [[] for ii in range(np-1)]        # List of lists
         for ii, mpv in enumerate(merge_pvals):
             # Merging patch ii and ii+1. Get the p-values
             dd = self.perform_linear_least_squares_fit(cand, fitpatch=ii,
                 offstd=offstd)
-            next_obs = patches[ii+1][0]         # First obs next patch
-            std = dd['stdrp'][oii[next_obs]]    # Prediction spread
-            rps = 0                             # Relative phase shift
+            next_obs = patches[ii+1][0]                 # First obs next patch
+            std = float(dd['stdrp'][oii[next_obs]])     # Prediction spread
+            rps = 0.0                                   # Relative phase shift
             pval = 1.0
             while pval > minpval:
                 # Symmetric for positive and negative phase shifts
@@ -359,12 +363,15 @@ class PulsarSolver(object):
                 lpval = sst.norm.cdf(left, loc=0.0, scale=std/P0)
                 rpval = sst.norm.cdf(right, loc=0.0, scale=std/P0)
                 pval = rpval-lpval
-                #print("pvals: ", lpval, rpval, pval, left, right, std/P0)
+
+                # When rps==0, we may need a log-pvalue to rank properly
+                compl = None if rps!=0 else sst.norm.logcdf(left, scale=std/P0)
+                val = (pval, compl)
 
                 if pval > minpval:
-                    mpv.append(pval)
+                    mpv.append(val)
                     if rps > 0:             # Add the negative p-val one as well
-                        mpv.insert(0, pval)
+                        mpv.insert(0, val)
 
                 rps += 1
 
@@ -526,16 +533,23 @@ class PulsarSolver(object):
         :param Nvec:
             The diagonal elements of the noise (co)variance matrix
         """
-        MNM = np.dot(Mj.T / Nvec, Mj)
-        Sigma_inv = MNM
-        cf = sl.cho_factor(Sigma_inv)   # Cond. number of Mj = 1. Always works
-        Sigma = sl.cho_solve(cf, np.eye(len(MNM)))
+        MNM = np.dot(Mj.T / Nvec, Mj)       # Diagonal matrix
+        Sigma = np.diag(1.0/np.diag(MNM))
+
+        #Sigma_inv = MNM
+        #try:
+        #    cf = sl.cho_factor(Sigma_inv)   # Cond. number of Mj = 1. Always works
+        #except np.linalg.LinAlgError as err:
+        #    print("ERROR!!!")
+        #    raise
+        #Sigma = sl.cho_solve(cf, np.eye(len(MNM)))
+
         jvals = np.dot(Sigma, np.dot(Mj.T, dt / Nvec))
         dtj = np.dot(Mj, jvals)
 
         return dt - dtj, jvals
 
-    def residuals(self, cand, exclude_nonconnected=False):
+    def residuals(self, cand, exclude_nonconnected=False, show=False):
         """Return the residuals, taking into account pulse number corrections
 
         Given a candidate solution, return the timing residuals, taking into
@@ -739,6 +753,49 @@ class PulsarSolver(object):
 
         return chi2, dof, pval
 
+    def get_efac_distribution(self, efac, scale=5.0):
+        """Given an efac, return the p-value"""
+        if efac > 1.0:
+            return 1.0 / (1.0 + (efac/scale)**2)
+        else:
+            return 1.0
+
+    def get_efac_pval(self, dd):
+        """Return the efac p-value for this solve
+
+        For the provided linear solution, calculate the p-value of the efac.
+
+        The efac we are calculating is the one that sets the xi^2 equal to one:
+        xi^2 =  (dt - M ksi)^T N^{-1} (dt - M ksi)
+
+        efac = sqrt(xi2/dof)
+
+        Where dt, N, and M are projected with the G-matrix
+
+        :param dd:
+            The linear solution
+        """
+        dt = dd['dtp']
+        M = dd['Mp']
+        N_cf = dd['Np_cf']
+
+        # We calculate the p-value from chi2 and the degrees of freedom. If
+        # dof=0, the p-value equals 1 (no discrepancy).
+        #dof = max(len(dt)-M.shape[1], 0)
+        dof = len(dt)
+        pval = 1.0
+        efacpval = 1.0
+        chi2 = 1.0
+        efac = 1.0
+
+        if dof > 0:
+            chi2 = float(np.dot(dt, sl.cho_solve(N_cf, dt)))
+            pval = sst.chi2.sf(chi2, dof)
+            efac = np.sqrt(chi2 / dof)
+            efacpval = self.get_efac_distribution(efac)
+
+        return chi2, dof, pval, efacpval, efac
+
     def fit_constrained_iterative(self, cand, lltol=0.1, maxiter=10,
             offstd=100.0):
         """Perform a constrained, iterative, linear fit
@@ -795,7 +852,7 @@ class PulsarSolver(object):
 
         return newcand, loglik
 
-    def perform_linear_least_squares_fit(self, cand, ass_cmin=None,
+    def perform_linear_least_squares_fit_old(self, cand, ass_cmin=None,
             ass_cmax=None, fitpatch=None, offstd=100.0):
         """Perform a constrained, linear, least-squares fit
 
@@ -893,22 +950,37 @@ class PulsarSolver(object):
             Mp = np.dot(Gj.T, Mtot)
             dtp = np.dot(Gj.T, dt)
             Np = np.dot(Gj.T * Nvec, Gj)
-            try:
-                Np_cf = sl.cho_factor(Np)
-            except np.linalg.LinAlgError as err:
-                print("Np = ", Np)
-                raise
-            MNM = np.dot(Mp.T, sl.cho_solve(Np_cf, Mp))
-            Sigma_inv = MNM + np.diag(Phivec_inv)
 
-            # TODO: Use regularized Mtot??
-            try:
-                Sigma_inv_cf = sl.cho_factor(Sigma_inv)
-                Sigma = sl.cho_solve(Sigma_inv_cf, np.eye(len(MNM)))
-            except np.linalg.LinAlgError as err:
-                print("Sigma_inv = ", Sigma_inv)
-                np.savetxt('Sigma_inv.txt', Sigma_inv)
-                raise
+            if Mp.shape[0] < Mp.shape[1]:
+                # Fewer effective observations than parameters.
+                # Do Woodbury the other way around
+                try:
+                    Np_cf = sl.cho_factor(Np)
+                    MNM = np.dot(Mp.T, sl.cho_solve(Np_cf, Mp))
+                    Sigma_inv = MNM + np.diag(Phivec_inv)
+                    # Use rank-reduced Cholesky code to invert Sigma_inv
+                    Sigma = rrd.get_rr_CiA(Phivec_inv, Mp.T, 1.0/np.diag(Np), np.eye(len(Phivec_inv)))
+                except np.linalg.LinAlgError as err:
+                    print("Inverse Woodbury also has problems... :(")
+                    raise
+            else:
+                try:
+                    Np_cf = sl.cho_factor(Np)
+                except np.linalg.LinAlgError as err:
+                    print("Cho Np = ", Np)
+                    np.savetxt('Np.txt', Np)
+                    raise
+                MNM = np.dot(Mp.T, sl.cho_solve(Np_cf, Mp))
+                Sigma_inv = MNM + np.diag(Phivec_inv)
+
+                # TODO: Use regularized Mtot??
+                try:
+                    Sigma_inv_cf = sl.cho_factor(Sigma_inv)
+                    Sigma = sl.cho_solve(Sigma_inv_cf, np.eye(len(MNM)))
+                except np.linalg.LinAlgError as err:
+                    print("Cho Sigma_inv = ", Sigma_inv)
+                    np.savetxt('Sigma_inv.txt', Sigma_inv)
+                    raise
 
             # Calculate the prediction quantities
             MNt = np.dot(Mp.T, sl.cho_solve(Np_cf, dtp))
@@ -959,6 +1031,222 @@ class PulsarSolver(object):
         dd['newpars'] = newcand.pars
         return dd
 
+    def perform_linear_least_squares_fit(self, cand, ass_cmin=None,
+            ass_cmax=None, fitpatch=None, offstd=100.0):
+        """Perform a constrained, linear, least-squares fit
+
+        Perform a constrained, linear, least-squares fit. Internally, normalize
+        the design matrix in order to regularize the linear algebra. Results
+        should remain the same as before
+
+        WARNING: the constraints are respected by removing degrees of freedom of
+                 the model. This is therefore not a true representation of the
+                 actual covariance in the model.
+
+        :param cand:
+            The candidate solution from where to start
+
+        :param ass_cmin:
+            Assumed constraint minimum bounds to respect
+
+        :param ass_cmax:
+            Assumed constraint minimum bounds to respect
+
+        :param fitpatch:
+            Number of the patch we are fitting to. This adds this particular
+            patch/jump into the timing model (like a tempo2 offset), with a
+            Gaussian prior with standard deviation offstd*P0.
+            Ideally we would use a flat prior on [0, P0], but we cannot do that
+            analytically.
+
+        :param offstd:
+            When using `fitpatch`, this parameter sets the width of the prior on
+            the jump/offset of all patches
+        """
+        dd = dict()
+        nobs = cand.nobs
+        obs_inds = cand.obs_inds
+
+        newcand, cmask = self.make_pars_respect_constraints(cand,
+                ass_cmin, ass_cmax)
+
+        # Create the full design matrix
+        # If we use 'fitpatch', we do not include a jump for patch 'fitpatch' in
+        # Mj. Instead, we include an offset for the entire dataset (Mo), because
+        # we need the uncertainty of the offset when doing prediction.
+        Mj = self.get_jump_designmatrix(newcand, fitpatch=fitpatch)
+        Mo = np.ones((nobs, 0 if fitpatch is None else 1))
+        Mt = self.designmatrix(newcand)[:,cmask][obs_inds]
+        Mtot_orig = np.append(Mt, Mo, axis=1)
+        Gj = self.get_jump_Gmatrix(newcand, fitpatch=fitpatch)
+        
+        # The parameter identifiers/keys
+        parlabelst = list(np.array(self._psr.pars(which='fit'))[cmask])
+        parlabelso = ['PatchOffset'] * Mo.shape[1]
+        parlabels = parlabelst + parlabelso
+
+        npart = Mtot_orig.shape[1]
+        nparj = Mj.shape[1]
+
+        # Create the noise and prior matrices
+        Nvec = self.toaerrs(newcand)[obs_inds]**2
+        Phivect = np.array([self._prerr[key]**2 for key in self._prerr])[cmask]
+        Phiveco = np.array([offstd/self._psr['F0'].val]*Mo.shape[1])**2
+        Phivec_orig = np.append(Phivect, Phiveco)
+        Phivec_inv_orig = 1.0/Phivec_orig
+
+        # We have Mtot_orig and Phivec_orig. Do the normalization
+        nv = np.mean(Nvec)
+        mu = np.sum(Mtot_orig**2, axis=0)
+        u = np.sqrt(mu/nv + Phivec_inv_orig)        # New units/normalization
+        Mtot = Mtot_orig / u
+
+        Phivec = np.append(Phivect, Phiveco) * u**2
+        Phivec_inv = 1.0/Phivec
+
+        prparst = np.array([self._prpars[key] for key in self._prpars])[cmask]
+        prparso = np.array([0.0]*Mo.shape[1])
+        prpars = np.append(prparst, prparso) * u
+        prpars_delta = prpars - np.append(cand.pars, prparso) * u
+
+        # phipar is the ML value of the TM parameters. But: we are calculating
+        # it with respect to the current value of the TM parameters.
+        phipar = prpars_delta * Phivec_inv  # Instead of: phipar = prpars * Phivec_inv
+
+        # Set psr parameters, and remove the phase offsets of the patches
+        dt_lt = self.residuals(newcand)[obs_inds]
+        dt, jvals = self.subtract_jumps(dt_lt, Mj, Nvec)
+
+        if nparj == nobs:
+            # We know nothing but the prior
+            Sigma_inv = np.diag(Phivec_inv)
+            Sigma = np.diag(Phivec)
+
+            dpars = np.dot(Sigma, phipar)
+            rp = 0.0 * dt               # Only true if pars chosen as ML prior
+            rr = np.dot(Mtot, np.dot(Sigma, Mtot.T))
+            rr = np.dot(Mtot, np.dot(np.diag(Phivec), Mtot.T))
+
+            Np = np.zeros((0,0))
+            MNM = np.zeros((0,0))
+            MNt = np.zeros(0)
+            Mp = np.zeros((0, Mtot.shape[1]))
+            dtp = np.zeros(0)
+            Np_cf = (np.zeros((0,0)), False)
+
+            loglik = 0.0
+            loglik_ml = 0.0
+
+            # Transform the units back
+            dpars = dpars / u
+            Sigma_inv = ((Sigma_inv*u).T*u).T
+            Sigma = ((Sigma/u).T/u).T
+        elif nparj < nobs:
+            # Transform M, N, dt
+            Mp = np.dot(Gj.T, Mtot)
+            dtp = np.dot(Gj.T, dt)
+            Np = np.dot(Gj.T * Nvec, Gj)
+
+            if Mp.shape[0] < Mp.shape[1]:
+                # Fewer effective observations than parameters
+                # Do Woodbury the other way around
+                try:
+                    Np_cf = sl.cho_factor(Np)
+                    MNM = np.dot(Mp.T, sl.cho_solve(Np_cf, Mp))
+                    Sigma_inv = MNM + np.diag(Phivec_inv)
+                    # Use rank-reduced Cholesky code to invert Sigma_inv
+                    Sigma = rrd.get_rr_CiA(Phivec_inv, Mp.T, 1.0/np.diag(Np), np.eye(len(Phivec_inv)))
+                except np.linalg.LinAlgError as err:
+                    print("Inverse Woodbury also has problems... :(")
+                    raise
+
+                #Phi = np.diag(Phivec)
+                #S2 = np.dot(Mp, np.dot(Phi, Mp.T)) + Np
+                #cf = sl.cho_factor(S2)
+                #Sigma = Phi - np.dot(Phi, np.dot(Mp.T, sl.cho_solve(cf, np.dot(Mp, Phi))))
+            else:
+                try:
+                    Np_cf = sl.cho_factor(Np)
+                except np.linalg.LinAlgError as err:
+                    print("ChoN Np = ", Np)
+                    #np.savetxt('Np.txt', Np)
+                    raise
+                MNM = np.dot(Mp.T, sl.cho_solve(Np_cf, Mp))
+                Sigma_inv = MNM + np.diag(Phivec_inv)
+
+                # TODO: Use regularized Mtot??
+                try:
+                    Sigma_inv_cf = sl.cho_factor(Sigma_inv)
+                    Sigma = sl.cho_solve(Sigma_inv_cf, np.eye(len(MNM)))
+                    #Qs, Rs = sl.qr(Sigma_inv) 
+                    #Sigma = sl.solve(Rs, Qs.T)
+                except np.linalg.LinAlgError as err:
+                    print("ChoN Sigma_inv = ", Sigma_inv)
+                    #np.savetxt('Sigma_inv.txt', Sigma_inv)
+                    #self.perform_linear_least_squares_fit_old(cand=cand,
+                    #        ass_cmin=ass_cmin,
+                    #        ass_cmax=ass_cmax, fitpatch=fitpatch, offstd=offstd)
+                    raise
+
+            # Calculate the prediction quantities
+            MNt = np.dot(Mp.T, sl.cho_solve(Np_cf, dtp))
+            dpars = np.dot(Sigma, MNt + phipar)
+            rp = np.dot(Mtot, np.dot(Sigma, MNt))   # Should be approx~0.0
+            rr = np.dot(Mtot, np.dot(Sigma, Mtot.T))
+
+            # Calculate the log-likelihood
+            logdetN2 = np.sum(np.log(np.diag(Np_cf[0])))
+            logdetphi2 = 0.5*np.sum(np.log(Phivec))
+            chi2dt = 0.5*np.dot(dtp, sl.cho_solve(Np_cf, dtp))
+            chi2phi = 0.5*np.sum(prpars_delta**2/Phivec)
+            chi2phi1 = 0.5*np.dot(dpars, np.dot(Sigma_inv, dpars))
+            chi2_active = 0.5*np.dot(dpars, np.dot(Sigma_inv, dpars))
+            # NOTE: chi2_active is zero _if_ we move to ML solution. We are dpars
+            #       away from there. That's why we subtract it from loglik.
+            #       Note also that, now, chi2phi1 and zi2_active are the same in
+            #       this rescaling
+            loglik = -logdetN2-logdetphi2-chi2dt-chi2phi+chi2phi1-chi2_active
+            loglik_ml = -logdetN2-logdetphi2-chi2dt-chi2phi+chi2phi1
+
+            # Transform the units back
+            MNM = ((MNM/u).T/u).T
+            MNt = MNt / u
+            Phivec = Phivec / u**2
+            Phivec_inv = Phivec_inv*u**2
+            Sigma_inv = ((Sigma_inv*u).T*u).T
+            Sigma = ((Sigma/u).T*u).T
+            dpars = dpars / u
+        else:
+            raise ValueError("# of patches is higher than # of observations")
+
+        # Wrap up in a dictionary, and return
+        dd['dt'] = dt                           # Timing residuals
+        dd['dtp'] = dtp                         # Projected timing residuals
+        dd['Mj'] = Mj                           # Jump design matrix
+        dd['Mt'] = Mt                           # Timing model design matrix
+        dd['Mtot'] = Mtot                       # Full design matrix
+        dd['Mp'] = Mp                           # Projected design matrix
+        dd['Gj'] = Gj                           # Jump design matrix G-matrix
+        dd['Nvec'] = Nvec                       # Noise matrix diagonal
+        dd['Np'] = Np                           # Projected noise matrix
+        dd['Np_cf'] = Np_cf                     # Cholesky factorized Np
+        dd['MNM'] = MNM                         # Data-only Sigma^-1
+        dd['MNt'] = MNt                         # Data-only parameters
+        dd['Phivec'] = Phivec                   # Prior diagnoal
+        dd['Phivec_inv'] = Phivec_inv           # Inverse prior diagonal
+        dd['Sigma_inv'] = Sigma_inv             # Parameter covariance (inv)
+        dd['Sigma'] = Sigma                     # Inverse parameter covariance
+        dd['dpars'] = dpars                     # Delta-parameters (the fit)
+        dd['rp'] = rp                           # Residual projection
+        # TODO: The abs here is totally incorrect!!!
+        dd['stdrp'] = np.sqrt(np.diag(np.abs(rr)))      # Residuals projection std
+        dd['parlabels'] = parlabels             # Parameter labels
+        dd['loglik'] = loglik                   # Log-likelihood
+        dd['loglik_ml'] = loglik_ml             # Log-likelihood (ML)
+        dd['cmask'] = cmask                     # The non-constraints mask
+        dd['newpars'] = newcand.pars
+        return dd
+
     def get_linear_solution(self, cand, fitpatch=None, offstd=100.0):
         """Return the quantities necessary for solving the linear system
 
@@ -988,7 +1276,7 @@ class PulsarSolver(object):
                 offstd=offstd)
         return dd
 
-    def solve(self):
+    def solve(self, maxit=np.inf, verbose=False):
         """Solve the pulsar hierarchically.
 
         Solve the pulsar hierarchically using the candidate tree. Do not explore
@@ -1006,24 +1294,30 @@ class PulsarSolver(object):
         prop_hist[cur_cand.get_history_hashable()] = True
 
         counter = 0
-        while not cur_cand.is_coherent() and counter<50:
+        while not cur_cand.is_coherent() and counter<maxit:
             # Optimize the next proposed candidate solution (constrained fit)
             cur_cand = cand_by_pval.pop()       # Largest p-value is popped
 
             new_cand, loglik = self.fit_constrained_iterative(cur_cand)
             cur_cand.pars = new_cand.pars
-            print("Trying: " + ', '.join(cur_cand.get_history()))
+            if verbose:
+                print("[{0}]: ".format(counter) +
+                        ', '.join(cur_cand.get_history()))
 
             # Perform an unconstrained fit for p-values, and get stats
             dd = self.perform_linear_least_squares_fit(cur_cand)
-            chi2, dof, pval = self.get_chi2_pvalue(dd)
+            #chi2, dof, pval = self.get_chi2_pvalue(dd)
+            chi2, dof, pval, efacpval, efac = self.get_efac_pval(dd)
             pulse_numbers = self.pulsenumbers(cur_cand)
+            if verbose:
+                print("   --- ", efac, efacpval, chi2, dof, pval)
 
             # Get the tree of merge p-values of children
             merge_pvals = self.get_merge_pvals(cur_cand, minpval=0.01)
 
             # Register all this information
-            cur_cand.register_optimized_results(chi2, dof, merge_pvals)
+            cur_cand.register_optimized_results(efacpval, chi2, dof,
+                    merge_pvals)
 
             # Add candidates from parent (delete or rpn shifts)
             additions = []
@@ -1083,9 +1377,11 @@ class CandidateSolution(object):
         # P-values
         self._delete_pvals_hist = []        # History of deletion p-values
         self._parent_chi2pval = 1.0         # Chi2 p-value of parent
-        self._proposed_pval = 1.0           # Prior-proposal probability
+        self._parent_efacpval = 1.0         # Efac p-value of parent
+        self._proposed_pval = (1.0, None)   # Prior-proposal probability
         self._origin = ("root",)            # Proposal origin
         self._chi2 = 1.0                    # Chi2 value of current solution
+        self._efac_pval = 1.0               # Efac p-value of current solution
         self._dof = 0                       # Chi2 degrees of freedom
         self._child_merge_pvals = []        # All children merge prior pvals
         self._hist_pval = None              # Priority p-value due to history
@@ -1130,7 +1426,10 @@ class CandidateSolution(object):
     def __eq__(self, other):
         """Compare p-values == """
         if isinstance(other, CandidateSolution):
-            return self.pval == other.pval
+            rv = (self.pval == other.pval)
+            if rv and self.pval_log is not None and other.pval_log is not None:
+                rv = (self.pval_log == other.pval_log)
+            return rv
         return NotImplemented
 
     def __ne__(self, other):
@@ -1143,26 +1442,38 @@ class CandidateSolution(object):
     def __gt__(self, other):
         """Compare p-values >"""
         if isinstance(other, CandidateSolution):
-            return self.pval > other.pval
+            rv = (self.pval > other.pval)
+            test = (self.pval == other.pval)
+            if test and \
+                    self.pval_log is not None and other.pval_log is not None:
+                rv = (self.pval_log < other.pval_log)
+            return rv
         return NotImplemented
 
     def __ge__(self, other):
         """Compare p-values >="""
-        if isinstance(other, CandidateSolution):
-            return self.pval >= other.pval
-        return NotImplemented
+        result = self.__lt__(other)
+        if result is NotImplemented:
+            return result
+        return not result
 
     def __lt__(self, other):
         """Compare p-values <"""
         if isinstance(other, CandidateSolution):
-            return self.pval < other.pval
+            test = (self.pval == other.pval)
+            rv = (self.pval < other.pval)
+            if test and \
+                    self.pval_log is not None and other.pval_log is not None:
+                rv = (self.pval_log > other.pval_log)
+            return rv
         return NotImplemented
 
     def __le__(self, other):
         """Compare p-values <="""
-        if isinstance(other, CandidateSolution):
-            return self.pval <= other.pval
-        return NotImplemented
+        result = self.__gt__(other)
+        if result is NotImplemented:
+            return result
+        return not result
 
     def have_child_phase_shift_pval(self, rpnshift, pi1, pi2):
         """Return True if we have the p-value for this phase shift in memory
@@ -1294,7 +1605,7 @@ class CandidateSolution(object):
         return np.where(comb)[0][0]
 
     def integrate_in_tree(self, origin=('root',), parent=None,
-            parent_chi2pval=1.0, proposed_pval=1.0):
+            parent_efacpval=1.0, parent_chi2pval=1.0, proposed_pval=(1.0,None)):
         """Integrate this solution in the candidate solution tree
 
         Integrate this solution in the candidate solution tree, and have the
@@ -1309,20 +1620,26 @@ class CandidateSolution(object):
         :param parent:
             Reference to the parent object
 
+        :param parent_efacpval:
+            The efac p-value of the parent solution
+
         :param parent_chi2pval:
             The p-value of the parent chi2 solution
 
         :param proposed_pval:
-            The p-value of this candidate, prior to evaluation/optimization
+            The p-value tuple of this candidate, prior to
+            evaluation/optimization
         """
         if origin == 'root':
             self._origin = ('root',)
             self._parent = None
             self._parent_chi2pval = 1.0
+            self._parent_efacpval = 1.0
         else:
             self._origin = origin
             self._parent = parent
             self._parent_chi2pval = parent_chi2pval
+            self._parent_efacpval = parent_efacpval
             self._proposed_pval = proposed_pval
 
             if origin[0] == 'delete':
@@ -1417,10 +1734,11 @@ class CandidateSolution(object):
         newcand = CandidateSolution(self)
         temp = newcand._patches.pop(pind)
         origin = ('delete', pind)
-        chi2, dof = self._chi2, self._dof
+        efac_pval, chi2, dof = self._efac_pval, self._chi2, self._dof
         parent_chi2pval = sst.chi2.sf(chi2, dof) if dof > 0 else 1.0
-        proposed_pval = delete_pvals[self._patches[pind][0]]
-        newcand.integrate_in_tree(origin, self, parent_chi2pval, proposed_pval)
+        proposed_pval = (delete_pvals[self._patches[pind][0]], None)
+        newcand.integrate_in_tree(origin, self, efac_pval,
+                parent_chi2pval, proposed_pval)
 
         self._delete_children[sspind] = newcand
 
@@ -1456,10 +1774,11 @@ class CandidateSolution(object):
 
         ch_index = self.get_child_index_from_phase_shift(rps, pind1, pind2)
 
-        chi2, dof = self._chi2, self._dof
+        efac_pval, chi2, dof = self._efac_pval, self._chi2, self._dof
         parent_chi2pval = sst.chi2.sf(chi2, dof) if dof > 0 else 1.0
         proposed_pval = self._child_merge_pvals[pind1][ch_index]
-        newcand.integrate_in_tree(origin, self, parent_chi2pval, proposed_pval)
+        newcand.integrate_in_tree(origin, self, efac_pval,
+                parent_chi2pval, proposed_pval)
 
         self._merge_children[pind1][ch_index] = newcand
 
@@ -1558,13 +1877,16 @@ class CandidateSolution(object):
             rpn = self._rpn[:fitpatch] + self._rpn[(fitpatch+1):]
         return rpn
 
-    def register_optimized_results(self, chi2, dof, child_merge_pvals):
+    def register_optimized_results(self, efac_pval, chi2, dof, child_merge_pvals):
         """After running an optimizer on this candidate, register the results
 
         After running an optimizer on this candidate, register all the
         probability results, so we can initialize children. If this is
         merged-patch solution with zero relative phase, also create the option
         to delete the point in the parent.
+
+        :param efac_pval
+            Efac p-value of the solution
 
         :param chi2:
             Chi^2 value of the solution
@@ -1577,6 +1899,7 @@ class CandidateSolution(object):
             Gaussian process approximation. The tree is 'only' populated up to
             some lowest p-value
         """
+        self._efac_pval = efac_pval
         self._chi2 = chi2
         self._dof = dof
         self._child_merge_pvals = child_merge_pvals
@@ -1669,7 +1992,7 @@ class CandidateSolution(object):
             hist += ['d-'+str(obsind)]
         elif self._origin[0] == 'rps':
             obsind = mapping[self._origin[3]]
-            hist += ['s-'+str(obsind)]
+            hist += ['s-'+str(self._origin[1])+'-'+str(obsind)]
         else:
             raise NotImplementedError("{0} not an origin ID".self._origin[0])
 
@@ -1722,13 +2045,25 @@ class CandidateSolution(object):
 
     @property
     def pval(self):
-        return self._proposed_pval * self._parent_chi2pval * self.hist_pval
+        return self._proposed_pval[0] * self._parent_efacpval * self.hist_pval
 
     @property
-    def hist_pval(self):
+    def pval_log(self):
+        #return False if self._proposed_pval[1] is None else True
+        return self._proposed_pval[1]
+
+    @property
+    def hist_pval_old(self):
         if self._hist_pval is None:
             self._hist_pval = np.log2(self.get_history_len()+1)
         return self._hist_pval
+
+    @property
+    def hist_pval(self):
+        pls = np.array([len(patch) for patch in self._patches])
+        nps = np.sum(pls > 1)    # Number of patches with nobs > 1
+        nobs = np.max(pls)
+        return np.log2(nobs+1) #* np.log(nps+5)/np.log(5)
 
     @property
     def nobs(self):
