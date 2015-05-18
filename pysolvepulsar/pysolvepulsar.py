@@ -41,6 +41,43 @@ tempo2_parbounds = {'F0': (0.0, np.inf),
 
 tempo2_parbounds_front = {'JUMP': ('P0', -0.5, 0.5)}
 
+def quantize(times,dt=86400):
+    """ Produce the quantisation matrix
+
+    Given the toas, produce the quantization matrix
+    
+    Note: taken from libstempo, but now uses mergesort to maintain order for
+          equal elements
+
+    :param times:
+        The observation times (TOAs)
+
+    :param dt:
+        Time-lag within which we consider TOAs within the same observing epoch
+    """
+    N = np
+
+    isort = N.argsort(times, kind='mergesort')
+    
+    bucket_ref = [times[isort[0]]]
+    bucket_ind = [[isort[0]]]
+    
+    for i in isort[1:]:
+        if times[i] - bucket_ref[-1] < dt:
+            bucket_ind[-1].append(i)
+        else:
+            bucket_ref.append(times[i])
+            bucket_ind.append([i])
+    
+    t = N.array([N.mean(times[l]) for l in bucket_ind],'d')
+    
+    U = N.zeros((len(times),len(bucket_ind)),'d')
+    for i,l in enumerate(bucket_ind):
+        U[l,i] = 1
+    
+    return t, U
+
+
 class PulsarSolver(object):
     """ This class provides a user interface to algorithmic timing methods
 
@@ -94,11 +131,6 @@ class PulsarSolver(object):
 
         # Set the deleted-point probabilities
         self.delete_prob = np.ones(self.nobs) * delete_prob
-
-        # Start with one candidate solution (based on the prior)
-        cand = CandidateSolution()
-        cand.set_start_solution(self)
-        self._candidates = [cand]
 
         # TODO: shift the PEPOCH
         self.set_pepoch_to_center()
@@ -156,6 +188,44 @@ class PulsarSolver(object):
         self._iisort = np.zeros_like(self._isort, dtype=np.int)
         for ii, p in enumerate(self._isort):
             self._iisort[p] = ii
+
+    def get_start_solution(self, mP0=1.0):
+        """Given the pulsar, get the starting solution
+
+        Given the pulsar, get the starting solution. This places every TOA in a
+        separate coherence patch, except for those within the same epoch.
+
+        :param mP0:
+            How many pulse periods fit within one epoch
+        """
+        P0 = 1.0/self._psr['F0'].val
+        # Quantization (timing model is treated as if the TOAs came from the
+        # same pulse) occurs when TOAs are separated by less than a pulse
+        # period. This is for numerical precision, they can still be shifted in
+        # relative pulse number.
+        self._tepoch, self._Umat = quantize(self._psr.toas(), dt=mP0*P0/86400.0)
+
+        patches = []
+        rpns = []
+        residuals = self._psr.residuals(updatebats=True,
+                formresiduals=True, removemean=False)[self._isort]
+        epns = self._psr.pulsenumbers(updatebats=False,
+                formresiduals=False, removemean=False)[self._isort]
+        for col in self._Umat[self._isort,:].T:
+            # Observations in this epoch are all coherent. Obtain the relative
+            # pulse numbers relative to the first observation by minimizing the
+            # residual distance.
+            msk = col.astype(bool)
+            dt_1 = residuals[msk]           # Residuals of epoch
+            dt_2 = dt_1 - dt_1[0]           # Residuals relative to dt_1[0]
+            epn_1 = epns[msk]
+            epn_2 = epn_1 - epn_1[0]        # T2 relative pulse number
+            rpn = (dt_2 + 0.5*P0)/P0 + epn_2
+
+            rpns.append(list(rpn.astype(int)))
+            patches.append(list(np.where(msk)[0]))
+
+        return patches, rpns
 
     def get_prior_bounds(self, key):
         """Given the parameter key, obtain the prior bound
@@ -721,6 +791,36 @@ class PulsarSolver(object):
 
         return M[selection,:]
 
+    def Umat(self, cand=None, exclude_nonconnected=False):
+        """Return the quantization matrix, possibly excluding non-connected toas
+
+        Return the quantization matrix. If exclude_nonconnected is True, then
+        only return the toas for which the patches in cand contain more than one
+        toa
+
+        Note: exclude_nonconnected will/might mess up the ordering of the
+              residuals
+
+        :param cand:
+            The candidate solution object
+
+        :param exclude_nonconnected:
+            If True, only return resiudals within coherent patches with more
+            than one residual
+        """
+        Umat = self._Umat[self._isort,:]
+        selection = np.array([], dtype=np.int) if exclude_nonconnected \
+                                               else np.arange(Umat.shape[0])
+
+        if exclude_nonconnected and cand is not None:
+            patches = cand.get_patches()
+            for pp, patch in enumerate(patches):
+                # Only return if requested
+                if len(patch) > 1:
+                    selection = np.append(selection, patch)
+
+        return Umat[selection,:]
+
 
     def get_chi2_pvalue(self, dd):
         """Return the chi2 p-value for this solve
@@ -1147,10 +1247,44 @@ class PulsarSolver(object):
             dtp = np.dot(Gj.T, dt)
             Np = np.dot(Gj.T * Nvec, Gj)
 
-            if Mp.shape[0] < Mp.shape[1]:
+            if Mp.shape[0] < 3: #Mp.shape[1]:  #<= Mp.shape[1]+20:
                 # Fewer effective observations than parameters
                 # Do Woodbury the other way around
+                """
                 try:
+                    # Open up a new can of worms. Get around degeneracy in the
+                    # timing model due to simultaneous observations. So we'll
+                    # use a rank-reduction through the quantization matrix, and
+                    # it's left-inverse. Woodbury identities abound!
+                    # Equation (...) of van Haaseren (2015) ...
+                    Umat = self.Umat()
+                    Uinv = ((1.0/np.sum(Umat, axis=0)) * Umat).T
+                    Up = np.dot(Gj.T, self.Umat())
+                    Me = np.dot(Uinv, Mtot)         # Mtot = Umat * Me
+                    Np_cf = sl.cho_factor(Np)
+                    UNU = np.dot(Up.T, sl.cho_solve(Np_cf, Up))
+                    MPM = np.dot(Me * Phivec, Me.T)
+                    MPM_cf = sl.cho_factor(MPM)
+                    MPMi = sl.cho_solve(MPM_cf, np.eye(len(MPM)))
+                    Sui = UNU + MPMi
+                    Sui_cf = sl.cho_factor(Sui)
+                    
+                    # Now we have the decompositions for C_inv, we can get on to
+                    # Sigma
+                    MNM = np.dot(Mp.T, sl.cho_solve(Np_cf, Mp))
+                    Sigma_inv = MNM + np.diag(Phivec_inv)
+                    CuiMP = sl.cho_solve(Sui_cf, Mp * Phivec)
+                    Sigma = np.diag(Phivec) - np.dot((Mp * Phivec).T, CuiMP)
+                    print("Going well...")
+
+                except np.linalg.LinAlgError as err:
+                    print("Fix the can of worms")
+                    raise
+                """
+
+                #"""
+                try:
+                    # Get the quantization matrix
                     Np_cf = sl.cho_factor(Np)
                     MNM = np.dot(Mp.T, sl.cho_solve(Np_cf, Mp))
                     Sigma_inv = MNM + np.diag(Phivec_inv)
@@ -1159,6 +1293,7 @@ class PulsarSolver(object):
                 except np.linalg.LinAlgError as err:
                     print("Inverse Woodbury also has problems... :(")
                     raise
+                #"""
 
                 #Phi = np.diag(Phivec)
                 #S2 = np.dot(Mp, np.dot(Phi, Mp.T)) + Np
@@ -1284,7 +1419,13 @@ class PulsarSolver(object):
         """
         # Root_cand is the root of the entire candidate tree
         root_cand = CandidateSolution()
-        root_cand.set_start_solution(self, pars=None)
+        start_pars = np.array([self._prpars[key] for key in self._prpars])
+
+        # Obtain the start patches, taking into account simultaneous
+        # observations
+        patches, rpn = self.get_start_solution(mP0=1.0)
+        root_cand.set_solution(start_pars, patches, rpn)
+
         root_cand.integrate_in_tree()
 
         cand_by_pval = [root_cand]      # This will be a sorted 
@@ -1313,7 +1454,7 @@ class PulsarSolver(object):
                 print("   --- ", efac, efacpval, chi2, dof, pval)
 
             # Get the tree of merge p-values of children
-            merge_pvals = self.get_merge_pvals(cur_cand, minpval=0.01)
+            merge_pvals = self.get_merge_pvals(cur_cand, minpval=0.001)
 
             # Register all this information
             cur_cand.register_optimized_results(efacpval, chi2, dof,
@@ -1366,7 +1507,6 @@ class CandidateSolution(object):
         self._pars = []
         self._patches = []
         self._rpn = []
-        self._psob = None
 
         # Tree references
         self._parent = None                 # Parent solution
@@ -1386,28 +1526,34 @@ class CandidateSolution(object):
         self._child_merge_pvals = []        # All children merge prior pvals
         self._hist_pval = None              # Priority p-value due to history
 
-    def set_start_solution(self, psob, pars=None, patches=None, rpn=None):
+    def set_start_solution(self, pars, nobs):
         """Set the start solution
 
         Set the starting solution
 
-        :param psob:
-            The PulsarSolver object we start from
+        :param pars:
+            Start parameters
+
+        :param nobs:
+            The number of observations
+        """
+        self._pars = pars.copy()
+        self.init_separate_patches()
+
+    def set_solution(self, pars, patches, rpn):
+        """Set the candidate solution
 
         :param pars:
-            Start parameters. If None, obtain from psob prior
+            Start parameters
+
+        :param paches:
+            Coherent patches
+
+        :param rpn:
+            Relative phase numbers within the patches
         """
-        self._psob = psob
-        if pars is None:
-            pars = np.array([psob._prpars[key] for key in psob._prpars])
-
-        self._pars = pars
-        nobs = len(psob.toas())
-
-        if patches is None or rpn is None:
-            self.init_separate_patches(nobs)
-        else:
-            self.set_patches(patches, rpn)
+        self._pars = pars.copy()
+        self.set_patches(patches, rpn)
 
     def copy_from_object(self, copyobject):
         """Copy all the information from an object into this one.
@@ -1421,7 +1567,6 @@ class CandidateSolution(object):
         self._pars = copy.deepcopy(copyobject._pars)
         self._rpn = copy.deepcopy(copyobject._rpn)
         self._patches = copy.deepcopy(copyobject._patches)
-        self._psob = copyobject._psob   # Shallow copy of course
 
     def __eq__(self, other):
         """Compare p-values == """
@@ -1583,8 +1728,7 @@ class CandidateSolution(object):
             Single point patch index
         """
         nop = np.array([len(patch) for patch in self._patches])
-        inds = np.where(nop == 1)[0]
-        return inds[sspind]
+        return np.where(nop == 1)[0][sspind]
 
     def get_sspind_from_patchind(self, pind):
         """Return the sspind, given the patch index
@@ -1595,14 +1739,10 @@ class CandidateSolution(object):
             The index of the patch
         """
         nop = np.array([len(patch) for patch in self._patches])
-        pmsk = np.zeros(len(self._patches), dtype=np.bool)
-        pmsk[pind] = True
-        comb = np.logical_and(nop == 1, pmsk)
-
-        if not np.sum(comb) == 1:
-            raise ValueError("{0} not an single-point patch".format(pind))
-
-        return np.where(comb)[0][0]
+        fullinds = np.zeros(len(nop), dtype=np.int)
+        pmsk = (nop == 1)
+        fullinds[pmsk] = np.arange(np.sum(pmsk))
+        return fullinds[pind]
 
     def integrate_in_tree(self, origin=('root',), parent=None,
             parent_efacpval=1.0, parent_chi2pval=1.0, proposed_pval=(1.0,None)):
