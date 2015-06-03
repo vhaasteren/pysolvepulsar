@@ -88,7 +88,7 @@ class PulsarSolver(object):
     """
 
     def __init__(self, parfile, timfile, priors=None, logfile=None,
-            loglevel=logging.DEBUG, delete_prob=0.01):
+            loglevel=logging.DEBUG, delete_prob=0.01, mP0=1.0):
         """Initialize the pulsar solver
 
         Initialize the pulsar solver by loading a libstempo object from a
@@ -112,6 +112,9 @@ class PulsarSolver(object):
         :param delete_prob:
             Proability that an observation needs to be deleted. Can be an array,
             with per-obs probabilities as well (default: 0.01)
+
+        :param mP0:
+            How many pulse periods fit within one epoch
         """
         self.load_pulsar(parfile, timfile)
         self.init_sorting_map()
@@ -134,6 +137,9 @@ class PulsarSolver(object):
 
         # TODO: shift the PEPOCH
         self.set_pepoch_to_center()
+
+        # Set the quantization matrix
+        self.set_quantization(mP0=mP0)
 
     def load_pulsar(self, parfile, timfile):
         """Read the pulsar object from par/tim file
@@ -189,14 +195,13 @@ class PulsarSolver(object):
         for ii, p in enumerate(self._isort):
             self._iisort[p] = ii
 
-    def get_start_solution(self, mP0=1.0):
-        """Given the pulsar, get the starting solution
+    def set_quantization(self, mP0=1.0):
+        """Set the quantization matrix, and the epochs
 
-        Given the pulsar, get the starting solution. This places every TOA in a
-        separate coherence patch, except for those within the same epoch.
+        Set the quantization matrix, and the pochs
 
         :param mP0:
-            How many pulse periods fit within one epoch
+            How many pulse periods fit within one epoch (max)
         """
         P0 = 1.0/self._psr['F0'].val
         # Quantization (timing model is treated as if the TOAs came from the
@@ -204,13 +209,21 @@ class PulsarSolver(object):
         # period. This is for numerical precision, they can still be shifted in
         # relative pulse number.
         self._tepoch, self._Umat = quantize(self._psr.toas(), dt=mP0*P0/86400.0)
+        self.nepochs = len(self._tepoch)
 
+    def get_start_solution(self):
+        """Given the pulsar, get the starting solution
+
+        Given the pulsar, get the starting solution. This places every TOA in a
+        separate coherence patch, except for those within the same epoch.
+        """
         patches = []
         rpns = []
         residuals = self._psr.residuals(updatebats=True,
                 formresiduals=True, removemean=False)[self._isort]
         epns = self._psr.pulsenumbers(updatebats=False,
                 formresiduals=False, removemean=False)[self._isort]
+        P0 = 1.0/self._psr['F0'].val
         for col in self._Umat[self._isort,:].T:
             # Observations in this epoch are all coherent. Obtain the relative
             # pulse numbers relative to the first observation by minimizing the
@@ -521,6 +534,52 @@ class PulsarSolver(object):
 
         return Gj[cand.obs_inds,:]
 
+    def get_jump_epoch_designmatrix(self, cand, fitpatch=None):
+        """Obtain the epoch-domain design matrix of inter-coherence-patch jumps
+
+        Obtain the design matrix of jumps that disconnect all the coherence
+        patches that are not phase connected. This version is carried out in the
+        epoch-domain (so it's Ui Mj)
+
+        :param cand:
+            CandidateSolution candidate
+
+        :param fitpatch:
+            If not None, exclude this patch from the designmatrix jumps
+
+        """
+        #TODO: This can be constructed directly with a little bit of extra code
+        Umat = self.Umat(cand)
+        Uinv = self.Umat_i(Umat=Umat)
+        Mj = self.get_jump_designmatrix(cand, fitpatch=fitpatch)
+        return np.dot(Uinv, Mj)
+
+    def get_jump_epoch_Gmatrix(self, cand, fitpatch=None):
+        """Obtain the complement/G-matrix of get_jump_epoch_designmatrix
+
+        Obtain the G-matrix that is complementary to the design matrix of jumps
+        that disconnect all the coherence patches that are not phase connected.
+        This version is carried out in the epoch-domain (so it is the complement
+        of the matrix Ui Mj)
+
+
+        :param cand:
+            CandidateSolution candidate
+
+        :param fitpatch:
+            If not None, exclude this patch from the designmatrix jumps
+
+        """
+        #TODO:This can be constructed analytically with a bit of extra code
+        Mj = self.get_jump_epoch_designmatrix(cand, fitpatch=fitpatch)
+        if Mj.shape[0] == Mj.shape[1]:
+            Gj = np.zeros((Mj.shape[0], 0))
+        else:
+            U, s, Vt = sl.svd(Mj)
+            Gj = U[:,Mj.shape[1]:]
+
+        return Gj
+
     def get_Gmatrix_onepatch_an(self, n):
         """For a single coherent patch, return the G-matrix
 
@@ -618,6 +677,42 @@ class PulsarSolver(object):
         dtj = np.dot(Mj, jvals)
 
         return dt - dtj, jvals
+
+    def map_patch2epatch(self, inds):
+        """Given indices of a patch, return the corresponding epatch
+
+        Given indices of a patch, return the corresponding epatch. Throw an
+        exception if an epoch is not fully filled.
+        """
+        # TODO: this can be faster without use of Umat
+        Umat = self.Umat()
+        Uinv = self.Umat_i(Umat=Umat)
+        
+        # Vector with patch indices set to one
+        allvals = np.zeros(self.nobs)
+        allvals[inds] = 1.0
+        evals = np.dot(Uinv, allvals)
+
+        # Check for not-completely filled epochs
+        msk = (evals != 0.0)
+        comp = np.ones(np.sum(msk))
+        if not np.allclose(comp, evals[msk]):
+            raise ValueError("Not fully coherent epoch detected in candidate")
+
+        return np.where(msk)[0]
+
+    def map_epatch2patch(self, einds):
+        """Given indices of an epatch, return the corresponding patch
+
+        Given indices of an epatch, return the corresponding patch.
+        """
+        # TODO: this can be faster without use of Umat
+        Umat = self.Umat()
+        evals = np.zeros(Umat.shape[1])
+        evals[einds] = 1.0
+        allvals = np.dot(Umat, evals)
+        msk = (allvals != 0.0)
+        return np.where(msk)[0]
 
     def residuals(self, cand, exclude_nonconnected=False, show=False):
         """Return the residuals, taking into account pulse number corrections
@@ -821,6 +916,34 @@ class PulsarSolver(object):
 
         return Umat[selection,:]
 
+    def Umat_i(self, cand=None, exclude_nonconnected=False, Umat=None):
+        """Return the left-inverse quantization matrix
+
+        Return the left-inverse quantization matrix. If exclude_nonconnected is
+        True, then only return the toas for which the patches in cand contain
+        more than one toa. This matrix is essentially the matrix that performs
+        unweighted epoch-averaging
+
+        Note: exclude_nonconnected will/might mess up the ordering of the
+              residuals
+
+        :param cand:
+            The candidate solution object
+
+        :param exclude_nonconnected:
+            If True, only return resiudals within coherent patches with more
+            than one residual
+
+        :param Umat:
+            If not None, this is the Umat matrix, so we do not have to
+            re-calculate that quantity
+        """
+        if Umat is None:
+            Umat = self.Umat(cand=cand,
+                    exclude_nonconnected=exclude_nonconnected)
+        #Umat_w = (Umat.T / Nvec).T
+        #Ui2 = ((1.0/np.sum(Umat_w, axis=0)) * Umat_w).T
+        return ((1.0/np.sum(Umat, axis=0)) * Umat).T
 
     def get_chi2_pvalue(self, dd):
         """Return the chi2 p-value for this solve
@@ -1217,8 +1340,9 @@ class PulsarSolver(object):
         dt_lt = self.residuals(newcand)[obs_inds]
         dt, jvals = self.subtract_jumps(dt_lt, Mj, Nvec)
 
-        if nparj == nobs:
-            # We know nothing but the prior
+        nepochs = len(self.map_patch2epatch(obs_inds))
+        if nparj == nepochs: #nobs:
+            # We know nothing but the prior. No fit for parameters
             Sigma_inv = np.diag(Phivec_inv)
             Sigma = np.diag(Phivec)
 
@@ -1233,6 +1357,7 @@ class PulsarSolver(object):
             Mp = np.zeros((0, Mtot.shape[1]))
             dtp = np.zeros(0)
             Np_cf = (np.zeros((0,0)), False)
+            Npi_dtp = np.zeros(0)
 
             loglik = 0.0
             loglik_ml = 0.0
@@ -1241,65 +1366,70 @@ class PulsarSolver(object):
             dpars = dpars / u
             Sigma_inv = ((Sigma_inv*u).T*u).T
             Sigma = ((Sigma/u).T/u).T
-        elif nparj < nobs:
+        elif nparj < nepochs: # nobs:
+            # We have to fit for the timing model
             # Transform M, N, dt
             Mp = np.dot(Gj.T, Mtot)
             dtp = np.dot(Gj.T, dt)
             Np = np.dot(Gj.T * Nvec, Gj)
 
-            if Mp.shape[0] < 3: #Mp.shape[1]:  #<= Mp.shape[1]+20:
+            if nepochs-nparj < npart: # Mp.shape[0] < Mp.shape[1]:  #<= Mp.shape[1]+20:
                 # Fewer effective observations than parameters
                 # Do Woodbury the other way around
-                """
-                try:
-                    # Open up a new can of worms. Get around degeneracy in the
-                    # timing model due to simultaneous observations. So we'll
-                    # use a rank-reduction through the quantization matrix, and
-                    # it's left-inverse. Woodbury identities abound!
-                    # Equation (...) of van Haaseren (2015) ...
-                    Umat = self.Umat()
-                    Uinv = ((1.0/np.sum(Umat, axis=0)) * Umat).T
-                    Up = np.dot(Gj.T, self.Umat())
-                    Me = np.dot(Uinv, Mtot)         # Mtot = Umat * Me
-                    Np_cf = sl.cho_factor(Np)
-                    UNU = np.dot(Up.T, sl.cho_solve(Np_cf, Up))
-                    MPM = np.dot(Me * Phivec, Me.T)
-                    MPM_cf = sl.cho_factor(MPM)
-                    MPMi = sl.cho_solve(MPM_cf, np.eye(len(MPM)))
-                    Sui = UNU + MPMi
-                    Sui_cf = sl.cho_factor(Sui)
-                    
-                    # Now we have the decompositions for C_inv, we can get on to
-                    # Sigma
-                    MNM = np.dot(Mp.T, sl.cho_solve(Np_cf, Mp))
-                    Sigma_inv = MNM + np.diag(Phivec_inv)
-                    CuiMP = sl.cho_solve(Sui_cf, Mp * Phivec)
-                    Sigma = np.diag(Phivec) - np.dot((Mp * Phivec).T, CuiMP)
-                    print("Going well...")
+                print("Epochs", self.nobs, self.nepochs)
+                if self.nobs != self.nepochs:
+                    # Some observations are in the same epoch, & inverse Woodbury
+                    Umat = self.Umat()[obs_inds,:]
+                    eps_inds = np.sum(Umat, axis=0) > 0       # Epoch indices
+                    Umat = Umat[:,eps_inds]
+                    Uinv = self.Umat_i(Umat=Umat)
+                    Nevec = 1.0/np.diag(np.dot(Umat.T / Nvec, Umat))
+                    Mte = np.dot(Uinv, Mtot)
 
-                except np.linalg.LinAlgError as err:
-                    print("Fix the can of worms")
-                    raise
-                """
+                    # Get the epoch_Gmatrix
+                    Mje = self.get_jump_epoch_designmatrix(
+                            newcand, fitpatch=fitpatch)[eps_inds,:]
+                    U, s, Vt = sl.svd(Mje)
+                    Gje = U[:,Mje.shape[1]:]
 
-                #"""
-                try:
-                    # Get the quantization matrix
-                    Np_cf = sl.cho_factor(Np)
-                    MNM = np.dot(Mp.T, sl.cho_solve(Np_cf, Mp))
-                    Sigma_inv = MNM + np.diag(Phivec_inv)
-                    # Use rank-reduced Cholesky code to invert Sigma_inv
-                    Sigma = rrd.get_rr_CiA(Phivec_inv, Mp.T, 1.0/np.diag(Np), np.eye(len(Phivec_inv)))
-                except np.linalg.LinAlgError as err:
-                    print("Inverse Woodbury also has problems... :(")
-                    raise
-                #"""
+                    Npe = np.dot(Gje.T * Nevec, Gje)
+                    Mpe = np.dot(Gje.T, Mte)
+                    #dtpe = np.dot(Gje.T, # CONTINUE HERE
+
+                    try:
+                        Npe_cf = sl.cho_factor(Npe)
+                        MNM = np.dot(Mpe.T, sl.cho_solve(Npe_cf, Mpe))
+                        Sigma_inv = MNM + np.diag(Phivec_inv)
+
+                        Ce = Npe + np.dot(Mpe * Phivec, Mpe.T)
+                        Ce_cf = sl.cho_factor(Ce)
+                        CeiMP = sl.cho_solve(Ce_cf, Mpe * Phivec)
+                        Sigma = np.diag(Phivec) - \
+                                np.dot((Mpe * Phivec).T, CeiMP)
+                        #Npi_dtp = np.dot(Mpe, sl.cho_solve(Npe_df, d
+                        print("Did the fit, biatch!")
+                    except np.linalg.LinAlgError as err:
+                        print("Inverse Woodbury also has problems... :(")
+                        raise
+                else:
+                    # No observations in the same epoch. Inverse Woodbury
+                    try:
+                        # Get the quantization matrix
+                        Np_cf = sl.cho_factor(Np)
+                        MNM = np.dot(Mp.T, sl.cho_solve(Np_cf, Mp))
+                        Sigma_inv = MNM + np.diag(Phivec_inv)
+                        # Use rank-reduced Cholesky code to invert Sigma_inv
+                        Sigma = rrd.get_rr_CiA(Phivec_inv, Mp.T, 1.0/np.diag(Np), np.eye(len(Phivec_inv)))
+                    except np.linalg.LinAlgError as err:
+                        print("Inverse Woodbury also has problems... :(")
+                        raise
 
                 #Phi = np.diag(Phivec)
                 #S2 = np.dot(Mp, np.dot(Phi, Mp.T)) + Np
                 #cf = sl.cho_factor(S2)
                 #Sigma = Phi - np.dot(Phi, np.dot(Mp.T, sl.cho_solve(cf, np.dot(Mp, Phi))))
             else:
+                # Regular Woodbury-type fit for the timing model
                 try:
                     Np_cf = sl.cho_factor(Np)
                 except np.linalg.LinAlgError as err:
@@ -1324,7 +1454,8 @@ class PulsarSolver(object):
                     raise
 
             # Calculate the prediction quantities
-            MNt = np.dot(Mp.T, sl.cho_solve(Np_cf, dtp))
+            #MNt = np.dot(Mp.T, sl.cho_solve(Np_cf, dtp))
+            MNt = np.dot(Mp.T, Npi_dtp)
             dpars = np.dot(Sigma, MNt + phipar)
             rp = np.dot(Mtot, np.dot(Sigma, MNt))   # Should be approx~0.0
             rr = np.dot(Mtot, np.dot(Sigma, Mtot.T))
@@ -1407,6 +1538,7 @@ class PulsarSolver(object):
 
         TODO: DEPRECATED. Just use perform_linear_least_squares_fit
         """
+        self._logger.warn('DEPRECATED FUNCTION: get_linear_solution')
         dd = self.perform_linear_least_squares_fit(cand, fitpatch=fitpatch,
                 offstd=offstd)
         return dd
@@ -1423,7 +1555,7 @@ class PulsarSolver(object):
 
         # Obtain the start patches, taking into account simultaneous
         # observations
-        patches, rpn = self.get_start_solution(mP0=1.0)
+        patches, rpn = self.get_start_solution()
         root_cand.set_solution(start_pars, patches, rpn)
 
         root_cand.integrate_in_tree()
