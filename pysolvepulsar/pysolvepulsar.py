@@ -1695,7 +1695,6 @@ class PulsarSolver(object):
         while not cur_cand.is_coherent() and counter<maxit:
             # Optimize the next proposed candidate solution (constrained fit)
             cur_cand = cand_by_pval.pop()       # Largest p-value is popped
-
             new_cand, loglik = self.fit_constrained_iterative(cur_cand)
             cur_cand.pars = new_cand.pars.copy()
             if verbose:
@@ -1710,14 +1709,33 @@ class PulsarSolver(object):
             if verbose:
                 print("   --- ", efac, efacpval, chi2, dof, pval)
 
-            # Get the tree of merge p-values of children
+            # Get the tree of merge p-values of children for this candidate
             merge_pvals = self.get_merge_pvals(cur_cand, minpval=0.001)
 
-            # Register all this information
+            # Register all this tree information to the current candidate
             cur_cand.register_optimized_results(efacpval, chi2, dof,
                     merge_pvals)
 
-            # Add candidates from parent (delete or rpn shifts)
+            # From here onwards, we are adding candidate solutions (proposals)
+            # to the tree and the sorted list. Add any advanced proposals to
+            # improve performance
+
+            # TODO: rpn=0 is not always the most likely merger, so it should not
+            #       always be first. What needs to be changed:
+            #       1) get_merge_pvals needs to become asymmetric (done)
+            #       2) get_merge_pvals should save information to further build
+            #          the merge tree
+            #       3) have_child_phase_shift_pval could be replaced by a
+            #          function that automatically extends the merge tree?
+            #       4) initialize_children_rpn0 should obtain the highest
+            #          likelihood phase shift from somewhere, and register that
+            #          value. Building the tree becomes asymmetric at that point
+            #       5) is_parent_delete_trigger should use that registered value
+
+            # If a child candidate was the first of a patch merger (highest
+            # likelihood phase shift), we will add the option to delete the
+            # single-point patches.
+            # TODO: Should rpn shifts be added here as well, or done separately?
             additions = []
             if cur_cand.is_parent_rpn_trigger():
                 rpn, p1, p2 = cur_cand.get_origin_patches()
@@ -1731,6 +1749,7 @@ class PulsarSolver(object):
             for addition in additions:
                 hist = addition.get_history_hashable()
                 if not hist in prop_hist:
+                    # Only add this proposal, if we have not used it before
                     ind = bisect.bisect_right(cand_by_pval, addition)
                     cand_by_pval.insert(ind, addition)
                     prop_hist[hist] = True
@@ -2100,6 +2119,12 @@ class CandidateSolution(object):
             if self.have_child_phase_shift_pval(0, pind1, pind2):
                 add.append(self.add_proposal_candidate_rpn(0, pind1, pind2,
                         pulse_numbers))
+            else:
+                # This phase shift/merger is so unlikely, we are not bothering
+                # to try even
+                # TODO: If all else fails, we should be able to do this type of
+                #       merger anyway
+                pass
 
         return add
 
@@ -2143,6 +2168,12 @@ class CandidateSolution(object):
                     self.have_child_phase_shift_pval(rps, pind1, pind2):
                 add.append(self.add_proposal_candidate_rpn(rps, pind1, pind2,
                         pulse_numbers))
+            elif not self.have_child_phase_shift_pval(rps, pind1, pind2):
+                # This phase shift/merger is so unlikely, we are not bothering
+                # to try even
+                # TODO: If all else fails, we should be able to do this type of
+                #       merger anyway
+                pass
 
         return add
 
