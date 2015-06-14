@@ -12,7 +12,6 @@ from __future__ import division
 import numpy as np
 import scipy.linalg as sl, scipy.stats as sst
 import logging
-import libstempo as lt
 import os, glob, sys
 import copy
 import bisect
@@ -22,6 +21,26 @@ try:
     from collections import OrderedDict
 except ImportError:
     from ordereddict import OrderedDict
+
+# Use the same interface for pint and libstempo
+try:
+    import pint.ltinterface as lti
+    pintpulsar = lti.pintpulsar
+    print("PINT available")
+    have_pint = True
+except ImportError:
+    pintpulsar = None
+    print("PINT not available")
+    have_pint = False
+try:
+    import libstempo as lt
+    tempopulsar = lt.tempopulsar
+    print("Libstempo available")
+    have_libstempo = True
+except ImportError:
+    tempopulsar = None
+    print("Libstempo not available")
+    have_libstempo = False
 
 # Parameters that have tempo2 status as parameter, but are not model parameters
 tempo2_excludepars = ['START', 'FINISH', 'PEPOCH', 'POSEPOCH', 'DMEPOCH',
@@ -88,7 +107,8 @@ class PulsarSolver(object):
     """
 
     def __init__(self, parfile, timfile, priors=None, logfile=None,
-            loglevel=logging.DEBUG, delete_prob=0.01, mP0=1.0):
+            loglevel=logging.DEBUG, delete_prob=0.01, mP0=1.0,
+            backend='libstempo'):
         """Initialize the pulsar solver
 
         Initialize the pulsar solver by loading a libstempo object from a
@@ -115,8 +135,11 @@ class PulsarSolver(object):
 
         :param mP0:
             How many pulse periods fit within one epoch
+
+        :param backend:
+            What timing package to use ('libstempo'/'pint')
         """
-        self.load_pulsar(parfile, timfile)
+        self.load_pulsar(parfile, timfile, backend=backend)
         self.init_sorting_map()
 
         # Set the logger
@@ -141,13 +164,23 @@ class PulsarSolver(object):
         # Set the quantization matrix
         self.set_quantization(mP0=mP0)
 
-    def load_pulsar(self, parfile, timfile):
+    def load_pulsar(self, parfile, timfile, backend='libstempo'):
         """Read the pulsar object from par/tim file
 
-        Use libstempo to read in a tempo2 pulsar from a parfile and a timfile
+        Use libstempo/pint to read in a tempo2 pulsar from a parfile and a
+        timfile
         """
-        self._psr = lt.tempopulsar(parfile, timfile, dofit=False)
+        if (backend == 'libstempo' and have_libstempo) or \
+            (backend == 'pint' and have_libstempo and not have_pint):
+            psrclass = tempopulsar
+        elif have_pint:
+            psrclass = pintpulsar
+        else:
+            raise ImportError("No pulsar backend available")
+        self._psr = psrclass(parfile, timfile, dofit=False)
+        self.psrclass = psrclass
         self.nobs = len(self._psr.toas())
+        self.name = self._psr.name
 
     def set_logger(self, logfile, loglevel):
         """Initialize the logger
@@ -211,6 +244,25 @@ class PulsarSolver(object):
         self._tepoch, self._Umat = quantize(self._psr.toas(), dt=mP0*P0/86400.0)
         self.nepochs = len(self._tepoch)
 
+    def savepar(self, parfilename, dd):
+        """Given a fit dictionary and a filename, save the parfile
+
+        Given a fit dictionary and a filename, save the parfile
+
+        :param parfilename:
+            Name of the parfile to save
+
+        :param dd:
+            Results dictionary
+        """
+        self._psr.vals(values=dd['newpars'], which='fit')
+
+        newerrs = self._psr.errs(which='fit')
+        newerrs[dd['cmask']] = np.sqrt(np.diag(dd['Sigma']))
+        newerrs = self._psr.errs(values=newerrs, which='fit')
+
+        self._psr.savepar(parfilename)
+
     def get_start_solution(self):
         """Given the pulsar, get the starting solution
 
@@ -240,7 +292,23 @@ class PulsarSolver(object):
 
         return patches, rpns
 
-    def get_prior_bounds(self, key):
+    def get_prior_values(self):
+        """Get an array with the prior values"""
+        return np.array([self._prpars[key] for key in self._prpars])
+
+    def get_prior_uncertainties(self):
+        """Get an array with the prior uncertainties"""
+        return np.array([self._prerr[key] for key in self._prerr])
+
+    def get_prior_min(self):
+        """Get an array with the prior minimum bounds"""
+        return np.array([self._prmin[key] for key in self._prmin])
+
+    def get_prior_max(self):
+        """Get an array with the prior maximum bounds"""
+        return np.array([self._prmax[key] for key in self._prmax])
+
+    def get_prior_bounds_from_psr(self, key):
         """Given the parameter key, obtain the prior bound
 
         Get the prior bound for the parameter key.
@@ -262,6 +330,7 @@ class PulsarSolver(object):
         Create a prior dictionary from the information in the parfile/libstempo
         object
         """
+        self._logger.warn("No proper tests for priors...")
         priors = OrderedDict()
         for key in self._psr.pars(which='set'):
             if not self._psr[key].fit and not key in tempo2_excludepars \
@@ -282,7 +351,7 @@ class PulsarSolver(object):
             # TODO: tempo2_nonmandatory is not always excluded. Should not be
             #       the case
             if not key in tempo2_excludepars and not key in tempo2_nonmandatory:
-                parmin, parmax = self.get_prior_bounds(key)
+                parmin, parmax = self.get_prior_bounds_from_psr(key)
                 priors[key] = (self._psr[key].val, self._psr[key].err, \
                         parmin, parmax)
 
@@ -385,8 +454,10 @@ class PulsarSolver(object):
         if np.any(np.logical_and(cmin, cmax)):
             raise ValueError("Cannot satisfy both min and max constraints.")
 
-        prparsmin = np.array([self._prmin[key] for key in self._prmin])
-        prparsmax = np.array([self._prmax[key] for key in self._prmax])
+        #prparsmin = np.array([self._prmin[key] for key in self._prmin])
+        #prparsmax = np.array([self._prmax[key] for key in self._prmax])
+        prparsmin = self.get_prior_min()
+        prparsmax = self.get_prior_max()
 
         newcand = CandidateSolution(cand)
         newcand.pars[cmin] = prparsmin[cmin]
@@ -714,7 +785,40 @@ class PulsarSolver(object):
         msk = (allvals != 0.0)
         return np.where(msk)[0]
 
-    def residuals(self, cand, exclude_nonconnected=False, show=False):
+    def pars(self, which='fit'):
+        """Return a list with parameter id's"""
+        return self._psr.pars(which=which)
+
+    def get_canonical_selection(self, cand, exclude_nonconnected=False):
+        """Given a candidate solution, return the quantity selection
+        
+        Return the selector. If exclude_nonconnected is True, then only return
+        the values for which the patches in cand contain more than one toa.
+        Deleted points (points not in a patch) are just returned, unless
+        exclude_nonconnected=True
+
+        Note: exclude_nonconnected will/might mess up the ordering of the
+              toas
+
+        :param cand:
+            The candidate solution object
+
+        :param exclude_nonconnected:
+            If True, only return uncertainties within coherent patches with more
+            than one residual
+        """
+        selection = np.array([], dtype=np.int) if exclude_nonconnected \
+                                               else np.arange(self.nobs)
+
+        if exclude_nonconnected and cand is not None:
+            patches = cand.get_patches()
+            for pp, patch in enumerate(patches):
+                # Only return if requested
+                if len(patch) > 1:
+                    selection = np.append(selection, patch)
+        return selection
+
+    def residuals(self, cand, exclude_nonconnected=False):
         """Return the residuals, taking into account pulse number corrections
 
         Given a candidate solution, return the timing residuals, taking into
@@ -751,6 +855,7 @@ class PulsarSolver(object):
             rpn = np.array(rpns[pp])
             rpn_lt = pn_lt[patch] - pn_lt[patch[0]]
 
+            #print("Here:", len(patch), dt[patch].shape, rpn_lt.shape, rpn.shape)
             dt[patch] += (rpn_lt - rpn) * P0
 
             if exclude_nonconnected and len(patch) > 1:
@@ -792,6 +897,54 @@ class PulsarSolver(object):
 
         return pn[selection]
 
+    def freqs(self, cand=None, exclude_nonconnected=False):
+        """Return the freqs, possibly excluding non-connected toas
+
+        Return the site freqs. If exclude_nonconnected is True, then only return
+        the toas for which the patches in cand contain more than one toa
+
+        Note: exclude_nonconnected will/might mess up the ordering of the
+              residuals
+
+        :param cand:
+            The candidate solution object
+
+        :param exclude_nonconnected:
+            If True, only return resiudals within coherent patches with more
+            than one residual
+        """
+        if cand is not None:
+            self._psr.vals(which='fit', values=cand.pars)
+
+        freqs = self._psr.freqs[self._isort]
+        selection = self.get_canonical_selection(cand, exclude_nonconnected)
+
+        return freqs[selection]
+
+    def stoas(self, cand=None, exclude_nonconnected=False):
+        """Return the site toas, possibly excluding non-connected toas
+
+        Return the site toas. If exclude_nonconnected is True, then only return
+        the toas for which the patches in cand contain more than one toa
+
+        Note: exclude_nonconnected will/might mess up the ordering of the
+              residuals
+
+        :param cand:
+            The candidate solution object
+
+        :param exclude_nonconnected:
+            If True, only return resiudals within coherent patches with more
+            than one residual
+        """
+        if cand is not None:
+            self._psr.vals(which='fit', values=cand.pars)
+
+        stoas = self._psr.stoas[self._isort]
+        selection = self.get_canonical_selection(cand, exclude_nonconnected)
+
+        return stoas[selection]
+
     def toas(self, cand=None, exclude_nonconnected=False):
         """Return the toas, possibly excluding non-connected toas
 
@@ -812,15 +965,7 @@ class PulsarSolver(object):
             self._psr.vals(which='fit', values=cand.pars)
 
         toas = self._psr.toas(updatebats=True)[self._isort]
-        selection = np.array([], dtype=np.int) if exclude_nonconnected \
-                                               else np.arange(len(toas))
-
-        if exclude_nonconnected and cand is not None:
-            patches = cand.get_patches()
-            for pp, patch in enumerate(patches):
-                # Only return if requested
-                if len(patch) > 1:
-                    selection = np.append(selection, patch)
+        selection = self.get_canonical_selection(cand, exclude_nonconnected)
 
         return toas[selection]
 
@@ -842,16 +987,7 @@ class PulsarSolver(object):
             than one residual
         """
         toaerrs = self._psr.toaerrs[self._isort]*1e-6
-        selection = np.array([], dtype=np.int) if exclude_nonconnected \
-                                               else np.arange(len(toaerrs))
-
-        if exclude_nonconnected and cand is not None:
-            patches = cand.get_patches()
-            for pp, patch in enumerate(patches):
-                # Only return if requested
-                if len(patch) > 1:
-                    selection = np.append(selection, patch)
-
+        selection = self.get_canonical_selection(cand, exclude_nonconnected)
         return toaerrs[selection]
 
     def designmatrix(self, cand, exclude_nonconnected=False):
@@ -874,15 +1010,7 @@ class PulsarSolver(object):
         M = self._psr.designmatrix(updatebats=True, fixunits=True,
                 fixsigns=True, incoffset=False)[self._isort,:]
 
-        selection = np.array([], dtype=np.int) if exclude_nonconnected \
-                                               else np.arange(M.shape[0])
-
-        if exclude_nonconnected:
-            patches = cand.get_patches()
-            for pp, patch in enumerate(patches):
-                # Only return if requested
-                if len(patch) > 1:
-                    selection = np.append(selection, patch)
+        selection = self.get_canonical_selection(cand, exclude_nonconnected)
 
         return M[selection,:]
 
@@ -904,16 +1032,7 @@ class PulsarSolver(object):
             than one residual
         """
         Umat = self._Umat[self._isort,:]
-        selection = np.array([], dtype=np.int) if exclude_nonconnected \
-                                               else np.arange(Umat.shape[0])
-
-        if exclude_nonconnected and cand is not None:
-            patches = cand.get_patches()
-            for pp, patch in enumerate(patches):
-                # Only return if requested
-                if len(patch) > 1:
-                    selection = np.append(selection, patch)
-
+        selection = self.get_canonical_selection(cand, exclude_nonconnected)
         return Umat[selection,:]
 
     def Umat_i(self, cand=None, exclude_nonconnected=False, Umat=None):
@@ -1052,12 +1171,12 @@ class PulsarSolver(object):
         niter = 0
 
         while notdone and niter < maxiter:
-            dd = self.perform_linear_least_squares_fit(newcand, offstd=100.0)
+            dd = self.perform_linear_least_squares_fit_old(newcand, offstd=100.0)
             loglik = dd['loglik_ml']
             newpars = dd['newpars']
             newpars[dd['cmask']] += dd['dpars']
-            prparsmin = np.array([self._prmin[key] for key in self._prmin])
-            prparsmax = np.array([self._prmax[key] for key in self._prmax])
+            prparsmin = self.get_prior_min()
+            prparsmax = self.get_prior_max()
             newcand.pars = newpars
             niter += 1
 
@@ -1132,11 +1251,11 @@ class PulsarSolver(object):
 
         # Create the noise and prior matrices
         Nvec = self.toaerrs(newcand)[obs_inds]**2
-        Phivect = np.array([self._prerr[key]**2 for key in self._prerr])[cmask]
+        Phivect = (self.get_prior_uncertainties()**2)[cmask]
         Phiveco = np.array([offstd/self._psr['F0'].val]*Mo.shape[1])**2
         Phivec = np.append(Phivect, Phiveco)
         Phivec_inv = 1.0/Phivec
-        prparst = np.array([self._prpars[key] for key in self._prpars])[cmask]
+        prparst = self.get_prior_values()[cmask]
         prparso = np.array([0.0]*Mo.shape[1])
         prpars = np.append(prparst, prparso)
         prpars_delta = np.append(prparst-cand.pars, prparso-prparso)
@@ -1313,7 +1432,7 @@ class PulsarSolver(object):
 
         # Create the noise and prior matrices
         Nvec = self.toaerrs(newcand)[obs_inds]**2
-        Phivect = np.array([self._prerr[key]**2 for key in self._prerr])[cmask]
+        Phivect = (self.get_prior_uncertainties()**2)[cmask]
         Phiveco = np.array([offstd/self._psr['F0'].val]*Mo.shape[1])**2
         Phivec_orig = np.append(Phivect, Phiveco)
         Phivec_inv_orig = 1.0/Phivec_orig
@@ -1327,7 +1446,7 @@ class PulsarSolver(object):
         Phivec = np.append(Phivect, Phiveco) * u**2
         Phivec_inv = 1.0/Phivec
 
-        prparst = np.array([self._prpars[key] for key in self._prpars])[cmask]
+        prparst = self.get_prior_values()[cmask]
         prparso = np.array([0.0]*Mo.shape[1])
         prpars = np.append(prparst, prparso) * u
         prpars_delta = prpars - np.append(cand.pars, prparso) * u
@@ -1448,7 +1567,7 @@ class PulsarSolver(object):
                 except np.linalg.LinAlgError as err:
                     print("ChoN Sigma_inv = ", Sigma_inv)
                     #np.savetxt('Sigma_inv.txt', Sigma_inv)
-                    #self.perform_linear_least_squares_fit_old(cand=cand,
+                    #self.perform_linear_least_squares_fit(cand=cand,
                     #        ass_cmin=ass_cmin,
                     #        ass_cmax=ass_cmax, fitpatch=fitpatch, offstd=offstd)
                     raise
@@ -1457,6 +1576,7 @@ class PulsarSolver(object):
             #MNt = np.dot(Mp.T, sl.cho_solve(Np_cf, dtp))
             MNt = np.dot(Mp.T, Npi_dtp)
             dpars = np.dot(Sigma, MNt + phipar)
+            # TODO: should use dpars, instead of MNt below here???
             rp = np.dot(Mtot, np.dot(Sigma, MNt))   # Should be approx~0.0
             rr = np.dot(Mtot, np.dot(Sigma, Mtot.T))
 
@@ -1551,7 +1671,7 @@ class PulsarSolver(object):
         """
         # Root_cand is the root of the entire candidate tree
         root_cand = CandidateSolution()
-        start_pars = np.array([self._prpars[key] for key in self._prpars])
+        start_pars = self.get_prior_values()
 
         # Obtain the start patches, taking into account simultaneous
         # observations
@@ -1643,7 +1763,7 @@ class CandidateSolution(object):
         # Tree references
         self._parent = None                 # Parent solution
         self._delete_children = []          # Children through deletion
-        self._delete_history = []              # Indices deleted observations
+        self._delete_history = []           # Indices deleted observations
         self._merge_children = []           # Children through patch-mergers
 
         # P-values
@@ -1862,6 +1982,20 @@ class CandidateSolution(object):
         nop = np.array([len(patch) for patch in self._patches])
         return np.where(nop == 1)[0][sspind]
 
+    def get_patch_from_obsind(self, oind):
+        """Return the patch index form the observation index
+
+        Return the patch index from the observation index
+
+        :param obsind:
+            Observation index
+        """
+        for ii, patch in enumerate(self._patches):
+            if oind in patch:
+                return ii
+
+        return None
+
     def get_sspind_from_patchind(self, pind):
         """Return the sspind, given the patch index
 
@@ -1875,6 +2009,23 @@ class CandidateSolution(object):
         pmsk = (nop == 1)
         fullinds[pmsk] = np.arange(np.sum(pmsk))
         return fullinds[pind]
+
+    def delete_observation(self, oind):
+        """Delete an observation
+
+        Delete an observation. If the patch is a single-point-patch, delete the
+        patch
+        """
+        pind = self.get_patch_from_obsind(oind)
+        if pind is None:
+            raise ValueError("Observation not included in a patch")
+
+        ind = self._patches[pind].index(oind)
+        temp = self._patches[pind].pop(ind)
+        temp = self._rpn[pind].pop(ind)
+        if len(self._patches[pind]) == 0:
+            temp = self._patches.pop(pind)
+            temp = self._rpn.pop(pind)
 
     def integrate_in_tree(self, origin=('root',), parent=None,
             parent_efacpval=1.0, parent_chi2pval=1.0, proposed_pval=(1.0,None)):
@@ -2106,6 +2257,50 @@ class CandidateSolution(object):
         self._patches = patches1 + [newpatch] + patches2 + patches3
         self._rpn = rpns1 + [newrpn] + rpns2 + rpns3
 
+    def split_patch(self, pind, msk):
+        """Split a patch in two
+
+        Given patch index pind, and observation index oind, split the patch
+        after oind.
+
+        :param pind:
+            Index of the patch
+
+        :param msk:
+            Mask, relative to this patch's content, of what to separate out
+        """
+        patches1, rpns1 = self._patches[:pind], self._rpn[:pind]
+        patches2, rpns2 = self._patches[pind+1:], self._rpn[pind+1:]
+
+        patch1 = list(np.array(self._patches[pind])[np.logical_not(msk)])
+        rpn1 = list(np.array(self._rpn[pind])[np.logical_not(msk)])
+        patch2 = list(np.array(self._patches[pind])[msk])
+        rpn2 = list(np.array(self._rpn[pind])[msk])
+
+        # Re-shift the rpns
+        rpn1 = [rp-np.min(rpn1) for rp in rpn1]
+        rpn2 = [rp-np.min(rpn2) for rp in rpn2]
+
+        self._patches = patches1 + [patch1, patch2] + patches2
+        self._rpn = rpns1 + [rpn1, rpn2] + rpns2
+
+    def add_rpn_jump(self, pind, msk, rpnjump=0):
+        """Add a shift in relative phase number for the masked observations
+
+        Add a shift in relative phase number for the masked observations.
+
+        :param pind:
+            Index of the patch
+
+        :param msk:
+            Mask, relative to this patch's content, which rpn's to shift
+
+        :param rpnjump:
+            By how many pulse numbers to shift the observations
+        """
+        newrpn = np.array(self._rpn[pind])
+        newrpn[msk] += rpnjump
+        self._rpn[pind] = list(newrpn)
 
     def get_patches(self, fitpatch=None):
         """Get the patches, minus element `fitpatch` if not None
