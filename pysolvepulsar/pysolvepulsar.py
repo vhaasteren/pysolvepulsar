@@ -509,17 +509,22 @@ class PulsarSolver(object):
                 offstd=offstd)
             next_obs = patches[ii+1][0]                 # First obs next patch
             std = float(dd['stdrp'][oii[next_obs]])     # Prediction spread
+            rpe = float(dd['rp'][oii[next_obs]])        # Prediction estimate
+            res = float(dd['dtp'][oii[next_obs]])       # First observation
+            pest = (rpe-res)/P0                         # Point estimate in P(x)
             rps = 0.0                                   # Relative phase shift
             pval = 1.0
             while pval > minpval:
-                # Symmetric for positive and negative phase shifts
-                left, right = rps-0.5, rps+0.5
+                # Non-symmetric for positive and negative phase shifts
+                left, right = pest+rps-0.5, pest+rps+0.5
                 lpval = sst.norm.cdf(left, loc=0.0, scale=std/P0)
                 rpval = sst.norm.cdf(right, loc=0.0, scale=std/P0)
                 pval = rpval-lpval
 
-                # When rps==0, we may need a log-pvalue to rank properly
-                compl = None if rps!=0 else sst.norm.logcdf(left, scale=std/P0)
+                # When rps==0, we may need a log-pvalue to rank properly. Use
+                # least-ranking value
+                rank = max(left, 0.0-right)
+                compl = None if rps!=0 else sst.norm.logcdf(rank, scale=std/P0)
                 val = (pval, compl)
 
                 if pval > minpval:
@@ -1680,7 +1685,7 @@ class PulsarSolver(object):
 
         root_cand.integrate_in_tree()
 
-        cand_by_pval = [root_cand]      # This will be a sorted 
+        cand_by_pval = [root_cand]      # This will be a sorted list (bisect)
         cur_cand = root_cand
 
         prop_hist = dict()      # Full proposal history to prevent duplicates
@@ -1692,7 +1697,7 @@ class PulsarSolver(object):
             cur_cand = cand_by_pval.pop()       # Largest p-value is popped
 
             new_cand, loglik = self.fit_constrained_iterative(cur_cand)
-            cur_cand.pars = new_cand.pars
+            cur_cand.pars = new_cand.pars.copy()
             if verbose:
                 print("[{0}]: ".format(counter) +
                         ', '.join(cur_cand.get_history()))
