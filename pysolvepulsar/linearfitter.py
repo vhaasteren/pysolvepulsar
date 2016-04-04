@@ -11,6 +11,7 @@ from __future__ import division
 
 import numpy as np
 import scipy.linalg as sl
+import logging
 
 class LinearFitter(object):
     """Linear fitter that works, regardless of the condition number"""
@@ -61,11 +62,15 @@ class LinearFitter(object):
         # Read in the parameters
         for key in ['toaerrs', 'residuals', 'Mj', 'Mo', 'Mt', 'Gj',
                 'parlabelst', 'parlabelso', 'Phivect', 'Phiveco', 'prparst',
-                'prparso', 'candpars']:
+                'prparso', 'candpars', '_logger']:
             setattr(self, key, kwargs.pop(key))
 
-        self.do_normalize = True if not 'normalize' in kwargs \
-                else kwargs.pop('normalize')
+        # Set the normalization
+        if 'normalize' in kwargs:
+            self.do_normalize = kwargs.pop('normalize')
+        else:
+            self.do_normalize = True
+        self._logger.info("Normalizing the solution: {0}".format(self.do_normalize))
 
         # Combine the timing model and the offset
         self.Mtot = np.append(self.Mt, self.Mo, axis=1)
@@ -119,6 +124,7 @@ class LinearFitter(object):
             self.Mtot_n = self.Mtot / self.norm
             self.Mp_n = self.Mp / self.norm
             self.MNt_n = self.MNt / self.norm          # TODO: Check this!!!!
+            self.MNt_n = self.MNt * self.norm          # TODO: Check this!!!!
             self.Phivec_n = self.Phivec * self.norm**2
             self.Phivec_inv_n = self.Phivec_inv / self.norm**2
             self.MNM_n = ((self.MNM*self.norm).T*self.norm).T
@@ -126,12 +132,14 @@ class LinearFitter(object):
             self.Sigma_inv_n = ((self.Sigma_inv/self.norm).T/self.norm).T
             self.dpars_n = self.dpars * self.norm
             self.phipar_n = self.phipar / self.norm    # TODO: Check this!!!!
+            self.phipar_n = self.phipar * self.norm    # TODO: Check this!!!!
             self.prpars_delta_n = self.prpars_delta * self.norm
             self.prpars_n = self.prpars * self.norm
         else:
             self.Mtot = self.Mtot_n * self.norm
             self.Mp = self.Mp_n * self.norm
             self.MNt = self.MNt_n * self.norm          # TODO: Check this!!!!
+            self.MNt = self.MNt_n / self.norm          # TODO: Check this!!!!
             self.Phivec = self.Phivec_n / self.norm**2
             self.Phivec_inv = self.Phivec_inv_n * self.norm**2
             self.MNM = ((self.MNM_n/self.norm).T/self.norm).T
@@ -139,6 +147,7 @@ class LinearFitter(object):
             self.Sigma_inv = ((self.Sigma_inv_n*self.norm).T*self.norm).T
             self.dpars = self.dpars_n / self.norm
             self.phipar = self.phipar_n * self.norm    # TODO: Check this!!!!
+            self.phipar = self.phipar_n / self.norm    # TODO: Check this!!!!
             self.prpars_delta = self.prpars_delta_n / self.norm
             self.prpars = self.prpars_n / self.norm
 
@@ -196,6 +205,7 @@ class LinearFitter(object):
 
     def reversed_woodbury_inverse(self):
         """Perform the linear least-squares fit inverse, #pars > #eff. obsns"""
+        self._logger.info("RevWood {0}, {1}".format(self.Gj.shape, self.Mtot_n.shape))
         self.Mp_n = np.dot(self.Gj.T, self.Mtot_n)
         self.dtp = np.dot(self.Gj.T, self.dt)
         self.Np = np.dot(self.Gj.T * self.Nvec, self.Gj)
@@ -286,6 +296,7 @@ class LinearFitter(object):
         dd['dtp'] = self.dtp                    # Projected timing residuals
         dd['Mj'] = self.Mj                      # Jump design matrix
         dd['Mt'] = self.Mt                      # Timing model design matrix
+        dd['Mo'] = self.Mo                      # Offset design matrix
         dd['Mtot'] = self.Mtot                  # Full design matrix
         dd['Mp'] = self.Mp                      # Projected design matrix
         dd['Gj'] = self.Gj                      # Jump design matrix G-matrix
@@ -306,19 +317,26 @@ class LinearFitter(object):
         dd['loglik'] = self.loglik              # Log-likelihood
         dd['loglik_ml'] = self.loglik_ml        # Log-likelihood (ML)
         dd['newpars'] = self.candpars                # The candidate parameters
+        dd['phipar'] = self.phipar                   # TODO: unnecessary?
+        dd['norm'] = self.norm
         return dd
 
     def fit(self):
         """Perform the linear least-squares fit, and extrapolate"""
         if self.nparj == self.nobs:
             # No information in data
+            self._logger.info("Doing the prior-inverse (nobs = nparj)")
             self.prior_inverse()
-        elif self.nobs - self.nparj < self.npart:
+        elif self.nobs - self.nparj > self.npart:
             # More parameters than observations (under constrained)
-            self.reversed_woodbury_inverse()
+            self._logger.info("Doing the canonical-Woodbury fit")
+            self._logger.info("{0} (nobs) - {1} (nparj) > {2} (npart)".format(self.nobs, self.nparj, self.npart))
+            self.canonical_woodbury_inverse()
         else:
             # More observations than parameters (over constrained)
-            self.canonical_woodbury_inverse()
+            self._logger.info("Doing the reverse-Woodbury fit")
+            self._logger.info("{0} (nobs) - {1} (nparj) < {2} (npart)".format(self.nobs, self.nparj, self.npart))
+            self.reversed_woodbury_inverse()
 
         self.finalize()
         self.normalize(normalize=self.do_normalize, forward=False)

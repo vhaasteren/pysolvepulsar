@@ -53,7 +53,7 @@ tempo2_excludepars = ['START', 'FINISH', 'PEPOCH', 'POSEPOCH', 'DMEPOCH',
                       'PLANET_SHAPIRO']
 
 # Parameters that are not always required to be fit for
-tempo2_nonmandatory = ['DM']
+tempo2_nonmandatory = {'DM':'DMX'}
 
 # Parameter bounds (min, max):
 tempo2_parbounds = {'F0': (0.0, np.inf),
@@ -108,16 +108,21 @@ def quantize(times, dt=86400, isort=None):
     
     return t, U
 
-def quantize_cand(times, cand, dt=86400, isort=None):
+def quantize_cand(times, cand, dt=86400):
     """ Produce the quantisation matrix, based on a candidate solution
 
-    Given the toas, produce the quantization matrix
+    Given the toas, produce the quantization matrix. This one also takes into
+    account the candidate solution, and requires the input to be _sorted_.
     
     Note: taken from libstempo, but now uses mergesort to maintain order for
           equal elements
 
     :param times:
         The observation times (TOAs)
+
+    :param cand:
+        The candidate solution. NOTE: the candidate solution has indices that
+        refer to _sorted_ toas. However, 
 
     :param dt:
         Time-lag within which we consider TOAs within the same observing epoch
@@ -127,8 +132,7 @@ def quantize_cand(times, cand, dt=86400, isort=None):
     if cand.nobs <= 0:
         raise ValueError("Candidate solution does not contain observations")
 
-    if isort is None:
-        isort = N.argsort(times, kind='mergesort')
+    isort = np.arange(len(times))
 
     obs2patch = cand.get_obsind2patch_map()
 
@@ -310,7 +314,7 @@ class PulsarSolver(object):
         #self._tepoch, self._Umat = quantize(self._psr.toas(), dt=mP0*P0/86400.0)
         self._umat_dt = mP0*P0/86400.0
         self._tepoch, self._Umat = quantize(self._psr.toas(),
-                dt=mP0*P0/86400.0, isort=self._isort)
+                dt=self._umat_dt, isort=self._isort)
         self.nepochs = len(self._tepoch)
 
     def savepar(self, parfilename, dd):
@@ -361,6 +365,21 @@ class PulsarSolver(object):
 
         return patches, rpns
 
+    def get_start_candidate(self):
+        """Given the pulsar, get an initial candidate solution
+
+        Given the pulsar, get the starting solution, and initialize a candidate
+        with that solution. This places every TOA in a separate coherence patch,
+        except for those within the same epoch.
+        """
+        patches, rpns = self.get_start_solution()
+        start_pars = self.get_prior_values()
+
+        cand = CandidateSolution()
+        cand.set_solution(start_pars, patches, rpns)
+
+        return cand
+
     def get_prior_values(self):
         """Get an array with the prior values"""
         return np.array([self._prpars[key] for key in self._prpars])
@@ -404,22 +423,29 @@ class PulsarSolver(object):
         for key in self._psr.pars(which='set'):
             if not self._psr[key].fit and not key in tempo2_excludepars \
                     and not key in tempo2_nonmandatory:
+                # Automatically turn on fitting for such parameters
                 self._logger.info(
                     'Fitting for {0} automatically turned on.'.format(key))
                 self._psr[key].fit = True
-            elif self._psr[key].fit and (key in tempo2_excludepars or key in
-                    tempo2_nonmandatory):
+            elif self._psr[key].fit and key in tempo2_excludepars:
+                # Automatically turn off fitting for these parameters
                 self._psr[key].fit = False
                 self._logger.info(
                     'Fitting for {0} automatically turned off.'.format(key))
+            elif self._psr[key].fit and key in tempo2_nonmandatory:
+                # Leave as it is in the parfile
+                pass
 
             if self._psr[key].err <= 0.0 and self._psr[key].fit:
                 self._logger.error('Prior for {0} cannot have 0 width'.
                         format(key))
 
-            # TODO: tempo2_nonmandatory is not always excluded. Should not be
-            #       the case
-            if not key in tempo2_excludepars and not key in tempo2_nonmandatory:
+                # If it is a JUMP, set it to the pulse width
+                if key[:4] in ['JUMP']:
+                    self._psr[key].err = 1.0/self._psr['F0'].val
+
+            # If we are 'fitting' for this parameter, add it to the prior
+            if self._psr[key].fit:
                 val = un_unitize(key, self._psr[key].val)
                 err = un_unitize(key, self._psr[key].err)
 
@@ -436,8 +462,9 @@ class PulsarSolver(object):
 
         :param priors:
             Dictionary with the priors for the paramters. Organized as
-            priors[key] = (parval, parsigma), with distribution as a normal
-            Gaussian distribution N(parval, parsigma)
+            priors[key] = (parval, parsigma, minbound, maxbound),
+            with distribution as a normal Gaussian distribution N(parval,
+            parsigma)
 
         This corresponds to a Gaussian prior, with mean parval, and standard
         deviation parsigma.
@@ -449,18 +476,6 @@ class PulsarSolver(object):
         set. Set parameters that do not have a prior are not fitted for, and a
         warning is displayed.
         """
-        # First un-set all the parameters from the par-file
-        un_fit = []
-        un_set = []
-        for key in self._psr.pars(which='set'):
-            if self._psr[key].set:
-                un_set.append(key)
-            if self._psr[key].fit:
-                un_fit.append(key)
-
-            self._psr[key].fit = False
-            #self._psr[key].set = False     # TODO: Cannot unset parameters
-
         self._pars = OrderedDict()
         self._prpars = OrderedDict()
         self._prerr = OrderedDict()
@@ -468,16 +483,15 @@ class PulsarSolver(object):
         self._prmax = OrderedDict()
 
         for key in priors:
-            self._psr[key].set = True
-            self._psr[key].fit = True
+            self._psr[key].set = True       # This _has_ to be that way
             # Do we set the initial value equal to the prior?
             #self._psr[key].val = priors[key][0]
 
             # We keep the value, so check whether it is somewhat consistent with
             # the prior. Give a warning otherwise
             val = un_unitize(key, self._psr[key].val)
-            pr =  un_unitize(key, priors[key][0])
-            pre =  un_unitize(key, priors[key][1])
+            pr = un_unitize(key, priors[key][0])
+            pre = un_unitize(key, priors[key][1])
             self.check_value_against_prior(val, pr, pre)
 
             self._pars[key] = self._psr[key].val
@@ -485,13 +499,6 @@ class PulsarSolver(object):
             self._prerr[key] = priors[key][1]
             self._prmin[key] = priors[key][2]
             self._prmax[key] = priors[key][3]
-
-        # Check whether we have any unset parameters we have not addressed
-        for key in np.unique(np.append(un_fit, un_set)):
-            if not key in priors and not key in tempo2_excludepars and not \
-                    key in tempo2_nonmandatory:
-                self._logger.info(
-                        "Prior for parameter {0} was not given. Ignoring.")
 
     def check_value_against_prior(self, parval, prval, prerr, siglevel=0.0001):
         """Check whether parval is consistent with N(prval, prerr)
@@ -699,8 +706,12 @@ class PulsarSolver(object):
         """
         #TODO: This can be constructed directly with a little bit of extra code
         Umat = self.Umat(cand)
+        self._logger.info("Umat2 = {0}".format(Umat.shape))
         Uinv = self.Umat_i(Umat=Umat)
         Mj = self.get_jump_designmatrix(cand, fitpatch=fitpatch)
+
+        #self._logger.info("Umat = {0}".format(Umat.shape))
+
         return np.dot(Uinv, Mj)
 
     def get_jump_epoch_Gmatrix(self, cand, fitpatch=None):
@@ -811,7 +822,7 @@ class PulsarSolver(object):
         :param Nvec:
             The diagonal elements of the noise (co)variance matrix
         """
-        raise NotImplementedError("This function is deprecated")
+        print("This function is being deprecated: subtract_jumps")
         MNM = np.dot(Mj.T / Nvec, Mj)       # Diagonal matrix
         Sigma = np.diag(1.0/np.diag(MNM))
 
@@ -934,7 +945,6 @@ class PulsarSolver(object):
             rpn = np.array(rpns[pp])
             rpn_lt = pn_lt[patch] - pn_lt[patch[0]]
 
-            #print("Here:", len(patch), dt[patch].shape, rpn_lt.shape, rpn.shape)
             dt[patch] += (rpn_lt - rpn) * P0
 
             if exclude_nonconnected and len(patch) > 1:
@@ -1111,8 +1121,8 @@ class PulsarSolver(object):
             than one residual
         """
         #Umat = self._Umat[self._isort,:]
-        te, Umat = quantize_cand(self._psr.toas(), cand,
-                dt=self._umat_dt, isort=self._isort)
+        te, Umat = quantize_cand(self._psr.toas()[self._isort], cand,
+                dt=self._umat_dt)
         selection = self.get_canonical_selection(cand, exclude_nonconnected)
         return Umat[selection,:]
 
@@ -1264,22 +1274,30 @@ class PulsarSolver(object):
         niter = 0
 
         while notdone and niter < maxiter:
+            self._logger.info("Fitting iteration {0}".format(niter))
             dd = self.perform_linear_least_squares_fit(newcand, offstd=100.0)
             loglik = dd['loglik_ml']
-            newpars = dd['newpars']
-            newpars[dd['cmask']] += dd['dpars']
+            #newpars = dd['newpars']
+            #newpars[dd['cmask']] += dd['dpars']
             prparsmin = self.get_prior_min()
             prparsmax = self.get_prior_max()
-            newcand.pars = newpars
+            newcand.pars[dd['cmask']] += dd['dpars']
+            #newcand.pars = newpars
             niter += 1
 
-            ass_cmin = (newpars < prparsmin)
-            ass_cmax = (newpars > prparsmax)
+            #ass_cmin = (newpars < prparsmin)
+            #ass_cmax = (newpars > prparsmax)
+            ass_cmin = (newcand.pars < prparsmin)
+            ass_cmax = (newcand.pars > prparsmax)
 
             if np.sum(np.append(ass_cmin, ass_cmax)) == 0 and \
                     np.abs(loglik - prevloglik) <= lltol:
                 notdone = False
             else:
+                # LOG: CONSTRAINTS (CHECK IT)
+                self._logger.info("Constraint violated: {0}".format(
+                        np.logical_or(ass_cmin, ass_cmax)))
+                self._logger.info("dd['cmask'] = {0}".format(dd['cmask']))
                 prevloglik = loglik
 
         if niter == maxiter:
@@ -1444,6 +1462,7 @@ class PulsarSolver(object):
         dd['dtp'] = dtp                         # Projected timing residuals
         dd['Mj'] = Mj                           # Jump design matrix
         dd['Mt'] = Mt                           # Timing model design matrix
+        dd['Mo'] = Mo                           # Offset design matrix
         dd['Mtot'] = Mtot                       # Full design matrix
         dd['Mp'] = Mp                           # Projected design matrix
         dd['Gj'] = Gj                           # Jump design matrix G-matrix
@@ -1463,6 +1482,7 @@ class PulsarSolver(object):
         dd['loglik'] = loglik                   # Log-likelihood
         dd['loglik_ml'] = loglik_ml             # Log-likelihood (ML)
         dd['cmask'] = cmask                     # The non-constraints mask
+        dd['phipar'] = phipar                   # TODO: unnecessary?
         dd['newpars'] = newcand.pars
         return dd
 
@@ -1727,7 +1747,7 @@ class PulsarSolver(object):
         return dd
 
     def perform_linear_least_squares_fit(self, cand, ass_cmin=None,
-            ass_cmax=None, fitpatch=None, offstd=100.0):
+            ass_cmax=None, fitpatch=None, offstd=100.0, normalize=True):
         """Perform a constrained, linear, least-squares fit
 
         Perform a constrained, linear, least-squares fit. Internally, normalize
@@ -1767,11 +1787,15 @@ class PulsarSolver(object):
 
         # Use the U-matrix to do the epoch-averaging (use obs_inds)
         Umat = self.Umat(newcand)[obs_inds]
+        self._logger.info("Umat1 = {0}".format(Umat.shape))
         toaerrs_f = self.toaerrs(newcand)[obs_inds]
         Uw = (Umat.T / toaerrs_f**2).T
         Umat_i = ((1.0/np.sum(Uw, axis=0)) * Uw).T  # A left-inverse of Umat
 
         # Get the epoch-ave data (again, use obs_inds), weighted by 1/toaerrs**2
+        #print("newcand.pars = ", newcand.pars)
+        #foobar = self.residuals(copy.deepcopy(newcand))
+        #barfoo = self.get_jump_epoch_Gmatrix(newcand, fitpatch=fitpatch)  # NOT same as dot(Umat_i, Gj_f)
         residuals = np.dot(Umat_i, self.residuals(newcand)[obs_inds])
         toaerrs = 1.0 / np.sqrt( np.sum(Uw, axis=0) )
 
@@ -1786,7 +1810,7 @@ class PulsarSolver(object):
         Mj = np.dot(Umat_i, Mj_f)       # Same as get_jump_epoch_designmatrix
         Mo = np.dot(Umat_i, Mo_f)
         Mt = np.dot(Umat_i, Mt_f)
-        Gj = self.get_jump_epoch_Gmatrix(cand)  # NOT same as dot(Umat_i, Gj_f)
+        Gj = self.get_jump_epoch_Gmatrix(newcand, fitpatch=fitpatch)  # NOT same as dot(Umat_i, Gj_f)
 
         # The parameter identifiers/keys
         parlabelst = list(np.array(self._psr.pars(which='fit'))[cmask])
@@ -1802,7 +1826,8 @@ class PulsarSolver(object):
                           Mt=Mt, Gj=Gj, parlabelst=parlabelst,
                           parlabelso=parlabelso, Phivect=Phivect,
                           Phiveco=Phiveco, prparst=prparst, prparso=prparso,
-                          candpars=cand.pars, normalize=True)
+                          candpars=newcand.pars, normalize=normalize,
+                          _logger=self._logger)
 
         # Return the fitting dictionary
         dd = lf.fit()
