@@ -287,7 +287,7 @@ class PulsarSolver(object):
         #self._logger.addHandler(ch)
 
     def init_sorting_map(self):
-        """Provide the sorting map and its inversion (NOT USED)
+        """Provide the sorting map and its inversion (inversion NOT USED)
 
         In order to study the coherence length, we need the toas to be sorted.
         We therefore create an index map to and from the libstempo object. We
@@ -1782,6 +1782,9 @@ class PulsarSolver(object):
         nobs = cand.nobs
         obs_inds = cand.obs_inds
 
+        # New candidate is the new solution that respects the constraints
+        # cmask is the boolean mask, indicating which constraints we are
+        # limited by
         newcand, cmask = self.make_pars_respect_constraints(cand,
                 ass_cmin, ass_cmax)
 
