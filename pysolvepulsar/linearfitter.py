@@ -210,6 +210,7 @@ class LinearFitter(object):
         self.dtp = np.dot(self.Gj.T, self.dt)
         self.Np = np.dot(self.Gj.T * self.Nvec, self.Gj)
 
+        # self.Mp_n has nan values (meaning the normalization has zeros!)
         try:
             self.Np_cf = sl.cho_factor(self.Np)
             self.MNM_n = np.dot(self.Mp_n.T, sl.cho_solve(self.Np_cf, self.Mp_n))
